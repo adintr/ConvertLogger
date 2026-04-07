@@ -1,0 +1,162 @@
+/*
+Anthropic API代理终端样式
+三区域布局：左主区域，右上token统计，右下历史记录
+*/
+
+/* 主容器布局 */
+#main-container {
+    height: 1fr;
+    width: 100%;
+}
+
+/* 左侧主区域 (75%宽度) */
+#left-panel {
+    width: 75%;
+    height: 100%;
+    border: solid $primary;
+    padding: 1;
+    margin: 0 1 0 0;
+    background: $surface;
+}
+
+/* 右侧辅助区域 (25%宽度) */
+#right-panel {
+    width: 25%;
+    height: 100%;
+    border: solid $secondary;
+    padding: 0;
+}
+
+/* 右侧内部面板通用样式 */
+.panel {
+    padding: 1;
+    border: solid $accent 50%;
+    margin: 0;
+}
+
+/* 面板标题 */
+.panel-title {
+    text-style: bold;
+    color: $text;
+    margin-bottom: 1;
+    padding-bottom: 1;
+    border-bottom: solid $accent 50%;
+}
+
+/* 右上角：token统计面板 (30%高度) */
+#token-stats-panel {
+    height: 30%;
+    background: $surface;
+}
+
+/* token显示区域 */
+#token-display {
+    padding: 1;
+    height: 1fr;
+    content-align: left middle;
+}
+
+/* 右下角：历史面板 (70%高度) */
+#history-panel {
+    height: 70%;
+    background: $surface-darken-1;
+}
+
+/* 历史表格样式 */
+#history-table {
+    height: 1fr;
+}
+
+#history-table:focus {
+    border: solid $primary;
+}
+
+DataTable > .datatable--cursor {
+    background: $primary 30%;
+}
+
+DataTable > .datatable--header {
+    background: $surface-darken-2;
+    text-style: bold;
+}
+
+/* API日志区域 */
+#api-log {
+    height: 85%;
+    border: solid $panel 50%;
+    padding: 0 1;
+    margin-bottom: 1;
+    background: $surface-darken-1;
+}
+
+/* 命令输入框 */
+#command-input {
+    height: 10%;
+    border: solid $primary 50%;
+    margin-top: 1;
+}
+
+#command-input:focus {
+    border: solid $primary;
+}
+
+/* 响应式调整 */
+/* 暂时禁用响应式布局
+@media (max-width: 120) {
+    #main-container {
+        flex-direction: column;
+    }
+
+    #left-panel {
+        width: 100%;
+        height: 70%;
+        margin: 0 0 1 0;
+    }
+
+    #right-panel {
+        width: 100%;
+        height: 30%;
+        flex-direction: row;
+    }
+
+    #token-stats-panel {
+        width: 50%;
+        height: 100%;
+    }
+
+    #history-panel {
+        width: 50%;
+        height: 100%;
+    }
+}
+*/
+
+/* 状态颜色 */
+.success {
+    color: $success;
+}
+
+.failed {
+    color: $error;
+}
+
+.warning {
+    color: $warning;
+}
+
+.info {
+    color: $primary;
+}
+
+/* 滚动条样式 */
+ScrollBar {
+    background: $surface-darken-2;
+}
+
+ScrollBar > .scrollbar-grip {
+    background: $primary 60%;
+}
+
+ScrollBar > .scrollbar-grip:hover {
+    background: $primary;
+}

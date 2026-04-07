@@ -1,0 +1,195 @@
+# Anthropic API代理配置
+# 使用YAML格式配置多个API提供商
+
+# 服务器全局配置
+server:
+  host: "0.0.0.0"            # 监听地址
+  port: 8000                 # 监听端口
+  workers: 1                 # 工作进程数
+  timeout: 30                # 请求超时时间(秒)
+  max_requests: 1000         # 最大并发请求数
+
+# 日志配置
+logging:
+  level: "INFO"             # 日志级别: DEBUG, INFO, WARNING, ERROR
+  file: "logs/api_proxy.log" # 日志文件路径
+  max_size: "10MB"          # 单个日志文件最大大小
+  backup_count: 5           # 保留的日志文件数量
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+
+# 缓存配置
+cache:
+  enabled: true             # 是否启用缓存
+  ttl: 300                  # 缓存存活时间(秒)
+  max_size: 1000            # 最大缓存条目数
+  backend: "memory"         # 缓存后端: memory, redis
+
+# 负载均衡策略
+load_balancing:
+  strategy: "round_robin"   # 策略: round_robin, weighted, least_connections
+  health_check_interval: 30 # 健康检查间隔(秒)
+  failover_enabled: true    # 是否启用故障转移
+
+# 重试配置
+retry:
+  max_attempts: 3           # 最大重试次数
+  backoff_factor: 1.5       # 退避因子
+  retryable_status_codes: [429, 500, 502, 503, 504] # 可重试的状态码
+
+# HTTP代理配置（全局设置，可被provider配置覆盖）
+proxy:
+  enabled: false            # 全局代理是否启用
+  url: "http://proxy.example.com:8080"  # 代理服务器地址
+  auth: "${PROXY_USER}:${PROXY_PASS}"   # 代理认证信息（可选）
+  bypass_local: true        # 是否绕过本地地址代理
+  bypass_domains:           # 需要绕过代理的域名列表
+    - "localhost"
+    - "127.0.0.1"
+    - "*.internal"
+
+# 监控配置
+monitoring:
+  enabled: true
+  metrics_port: 9090
+  prometheus_enabled: true
+
+# API提供商配置
+providers:
+  # 官方Anthropic API
+  - name: "anthropic_official"
+    enabled: true
+    type: "anthropic"
+    base_url: "https://api.anthropic.com"
+    api_key: "${ANTHROPIC_API_KEY}"  # 从环境变量读取
+    models:
+      - "claude-3-opus-20240229"
+      - "claude-3-sonnet-20240229"
+      - "claude-3-haiku-20240307"
+      - "claude-2.1"
+      - "claude-2.0"
+    weight: 10              # 负载均衡权重
+    timeout: 60             # 请求超时(秒)
+    max_tokens_per_minute: 100000  # 速率限制
+    max_requests_per_minute: 1000
+    priority: 1             # 优先级(1最高)
+    features:
+      - "streaming"
+      - "tool_use"
+      - "vision"
+
+  # Azure OpenAI (兼容Anthropic API)
+  - name: "azure_openai"
+    enabled: true
+    type: "azure"
+    base_url: "https://{your-resource-name}.openai.azure.com/openai/deployments/{deployment-name}"
+    api_key: "${AZURE_OPENAI_KEY}"
+    api_version: "2024-02-01"
+    models:
+      - "gpt-4"
+      - "gpt-4-turbo"
+      - "gpt-3.5-turbo"
+    weight: 8
+    timeout: 45
+    max_tokens_per_minute: 50000
+    max_requests_per_minute: 500
+    priority: 2
+    headers:
+      api-key: "${AZURE_OPENAI_KEY}"
+
+  # 第三方代理服务
+  - name: "third_party_proxy"
+    enabled: false          # 默认禁用
+    type: "proxy"
+    base_url: "https://api.example.com/v1"
+    api_key: "${THIRD_PARTY_KEY}"
+    models:
+      - "claude-3-opus"
+      - "claude-3-sonnet"
+    weight: 5
+    timeout: 90
+    max_tokens_per_minute: 20000
+    max_requests_per_minute: 200
+    priority: 3
+    auth_type: "bearer"     # 认证类型: bearer, api_key
+    # HTTP代理配置
+    proxy_enabled: true     # 启用代理
+    proxy_url: "http://proxy.example.com:8080"  # 代理服务器地址
+    proxy_auth: "${PROXY_USER}:${PROXY_PASS}"   # 代理认证信息（可选）
+
+  # 本地测试服务
+  - name: "local_test"
+    enabled: true
+    type: "test"
+    base_url: "http://localhost:8001"
+    api_key: "test-key-123"
+    models:
+      - "claude-3-test"
+    weight: 1
+    timeout: 10
+    max_tokens_per_minute: 1000
+    max_requests_per_minute: 100
+    priority: 4
+    features:
+      - "testing"
+      - "mock_responses"
+
+# 模型路由规则
+routing_rules:
+  # 按模型名称路由
+  - rule_type: "model"
+    pattern: "claude-*"
+    providers: ["anthropic_official", "third_party_proxy"]
+    strategy: "round_robin"
+
+  - rule_type: "model"
+    pattern: "gpt-*"
+    providers: ["azure_openai"]
+    strategy: "direct"
+
+  # 按请求参数路由
+  - rule_type: "parameter"
+    parameter: "stream"
+    value: true
+    providers: ["anthropic_official"]
+
+  # 按时间路由(负载高峰时段)
+  - rule_type: "time"
+    start_time: "09:00"
+    end_time: "18:00"
+    weekdays: [1, 2, 3, 4, 5]  # 周一至周五
+    providers: ["anthropic_official", "azure_openai"]
+
+  # 默认路由规则
+  - rule_type: "default"
+    providers: ["anthropic_official"]
+    strategy: "weighted"
+
+# 故障转移配置
+failover:
+  enabled: true
+  check_interval: 10
+  failure_threshold: 3
+  recovery_time: 300
+  backup_providers: ["azure_openai", "third_party_proxy"]
+
+# 统计和监控
+statistics:
+  enabled: true
+  retention_days: 30
+  export_format: "json"
+  metrics:
+    - "request_count"
+    - "token_usage"
+    - "response_time"
+    - "error_rate"
+    - "provider_health"
+
+# Webhook配置
+webhooks:
+  enabled: false
+  url: "https://hooks.example.com/api-proxy"
+  events:
+    - "provider_failed"
+    - "rate_limit_exceeded"
+    - "high_error_rate"
+  secret: "${WEBHOOK_SECRET}"
