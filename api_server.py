@@ -204,6 +204,33 @@ class ProviderClient:
 class APIServer:
     """API代理服务器"""
 
+    class EnhancedStatisticsCollector(StatisticsCollector):
+        """增强的统计收集器，支持事件广播"""
+
+        def __init__(self, server_instance):
+            super().__init__()
+            self.server = server_instance
+            self.last_broadcast_time = 0.0
+            self.broadcast_interval = 1.0  # 广播间隔(秒)
+
+        def add_request(self, stats: RequestStatistics):
+            """添加请求统计，并检查是否需要广播"""
+            super().add_request(stats)
+
+            # 检查是否需要广播更新
+            current_time = time.time()
+            if current_time - self.last_broadcast_time >= self.broadcast_interval:
+                asyncio.create_task(self._broadcast_update())
+                self.last_broadcast_time = current_time
+
+        async def _broadcast_update(self):
+            """广播统计更新"""
+            try:
+                summary = self.get_summary()
+                await self.server._broadcast_statistics_update()
+            except Exception as e:
+                logging.error(f"广播统计更新失败: {e}")
+
     def __init__(self, config: Config):
         self.config = config
         self.app = web.Application()
@@ -211,8 +238,14 @@ class APIServer:
         self.site: Optional[web.TCPSite] = None
 
         # 初始化组件
-        self.statistics = StatisticsCollector()
+        self.statistics = self.EnhancedStatisticsCollector(self)
         self.provider_clients: Dict[str, ProviderClient] = {}
+
+        # WebSocket支持
+        self.websocket_clients = set()  # 连接的WebSocket客户端
+        self.heartbeat_interval = 30.0  # 心跳间隔(秒)
+        self.last_heartbeat_time = 0.0
+        self.start_time = time.time()  # 服务器启动时间
 
         # 设置路由
         self.setup_routes()
@@ -230,6 +263,9 @@ class APIServer:
         self.app.router.add_get("/health", self.handle_health)
         self.app.router.add_get("/stats", self.handle_stats)
         self.app.router.add_get("/config", self.handle_config)
+
+        # WebSocket端点
+        self.app.router.add_get("/ws", self.handle_websocket)
 
     async def initialize(self) -> None:
         """初始化服务器"""
@@ -321,6 +357,10 @@ class APIServer:
 
         logging.info(f"API代理服务器启动在 http://{self.config.server.host}:{self.config.server.port}")
 
+        # 启动心跳任务
+        self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
+        logging.info("心跳任务已启动")
+
     async def stop(self) -> None:
         """停止服务器"""
         # 关闭provider客户端
@@ -332,6 +372,15 @@ class APIServer:
             await self.site.stop()
         if self.runner:
             await self.runner.cleanup()
+
+        # 停止心跳任务
+        if hasattr(self, '_heartbeat_task') and not self._heartbeat_task.done():
+            self._heartbeat_task.cancel()
+            try:
+                await self._heartbeat_task
+            except asyncio.CancelledError:
+                pass
+            logging.info("心跳任务已停止")
 
         logging.info("API代理服务器已停止")
 
@@ -569,8 +618,196 @@ class APIServer:
 
             self.statistics.add_request(stats)
 
+            # 广播请求日志
+            try:
+                log_data = {
+                    "provider": provider,
+                    "model": model,
+                    "status_code": status_code,
+                    "success": status_code < 400,
+                    "response_time": response_time,
+                    "prompt_tokens": prompt_tokens,
+                    "completion_tokens": completion_tokens,
+                    "total_tokens": total_tokens,
+                    "timestamp": time.time()
+                }
+                asyncio.create_task(self._broadcast_request_log(log_data))
+            except Exception as log_error:
+                logging.warning(f"广播请求日志失败: {log_error}")
+
         except Exception as e:
             logging.warning(f"收集统计信息失败: {e}")
+
+    # WebSocket处理方法
+    async def handle_websocket(self, request: web.Request) -> web.WebSocketResponse:
+        """处理WebSocket连接"""
+        ws = web.WebSocketResponse()
+        await ws.prepare(request)
+
+        # 注册客户端
+        self.websocket_clients.add(ws)
+        logging.info(f"WebSocket客户端已连接，当前客户端数: {len(self.websocket_clients)}")
+
+        # 发送欢迎消息
+        welcome_msg = {
+            "type": "server_status",
+            "timestamp": datetime.now().isoformat(),
+            "data": {
+                "status": "connected",
+                "clients": len(self.websocket_clients),
+                "server_time": datetime.now().isoformat()
+            }
+        }
+        await ws.send_str(json.dumps(welcome_msg))
+
+        try:
+            async for msg in ws:
+                if msg.type == aiohttp.WSMsgType.TEXT:
+                    await self._handle_ws_message(ws, msg.data)
+                elif msg.type == aiohttp.WSMsgType.ERROR:
+                    logging.error(f"WebSocket错误: {ws.exception()}")
+                    break
+                elif msg.type in (aiohttp.WSMsgType.CLOSE,
+                                 aiohttp.WSMsgType.CLOSING,
+                                 aiohttp.WSMsgType.CLOSED):
+                    logging.info("WebSocket连接关闭")
+                    break
+        finally:
+            # 清理客户端
+            self.websocket_clients.remove(ws)
+            logging.info(f"WebSocket客户端已断开，剩余客户端数: {len(self.websocket_clients)}")
+
+        return ws
+
+    async def _handle_ws_message(self, ws: web.WebSocketResponse, raw_message: str):
+        """处理WebSocket消息"""
+        try:
+            message = json.loads(raw_message)
+            msg_type = message.get("type")
+            msg_data = message.get("data", {})
+
+            logging.debug(f"收到WebSocket消息: {msg_type}")
+
+            if msg_type == "command":
+                await self._handle_ws_command(ws, msg_data)
+            elif msg_type == "ping":
+                # 心跳响应
+                await ws.send_str(json.dumps({
+                    "type": "pong",
+                    "timestamp": datetime.now().isoformat(),
+                    "data": {"server_time": datetime.now().isoformat()}
+                }))
+
+        except json.JSONDecodeError:
+            logging.warning(f"无效的JSON消息: {raw_message[:100]}")
+
+    async def _handle_ws_command(self, ws: web.WebSocketResponse, data: dict):
+        """处理WebSocket命令"""
+        action = data.get("action")
+        logging.info(f"处理WebSocket命令: {action}")
+
+        if action == "shutdown":
+            # 优雅关闭命令
+            await self._broadcast_ws_message("server_status", {
+                "status": "shutting_down",
+                "message": "服务器正在关闭"
+            })
+            # 在实际实现中，这里应该触发服务器关闭流程
+            logging.info("收到关闭命令")
+
+        elif action == "get_stats":
+            # 获取统计信息
+            stats = self.statistics.get_summary()
+            await self._send_ws_message(ws, "statistics_update", stats)
+
+        elif action == "get_config":
+            # 获取配置信息
+            config_summary = self.config.get_config_summary()
+            await self._send_ws_message(ws, "config_info", config_summary)
+
+        else:
+            await self._send_ws_message(ws, "error", {
+                "message": f"未知命令: {action}",
+                "available_commands": ["shutdown", "get_stats", "get_config"]
+            })
+
+    async def _send_ws_message(self, ws: web.WebSocketResponse, msg_type: str, data: dict):
+        """发送消息到指定WebSocket客户端"""
+        message = {
+            "type": msg_type,
+            "timestamp": datetime.now().isoformat(),
+            "data": data
+        }
+        try:
+            await ws.send_str(json.dumps(message))
+        except Exception as e:
+            logging.error(f"发送WebSocket消息失败: {e}")
+
+    async def _broadcast_ws_message(self, msg_type: str, data: dict):
+        """广播消息到所有WebSocket客户端"""
+        if not self.websocket_clients:
+            return
+
+        message = {
+            "type": msg_type,
+            "timestamp": datetime.now().isoformat(),
+            "data": data
+        }
+        message_json = json.dumps(message)
+
+        disconnected_clients = []
+        for ws in list(self.websocket_clients):
+            try:
+                await ws.send_str(message_json)
+            except Exception as e:
+                logging.error(f"广播消息失败，客户端可能已断开: {e}")
+                disconnected_clients.append(ws)
+
+        # 清理断开连接的客户端
+        for ws in disconnected_clients:
+            self.websocket_clients.remove(ws)
+
+    async def _broadcast_statistics_update(self):
+        """广播统计更新"""
+        if not self.websocket_clients:
+            return
+
+        stats = self.statistics.get_summary()
+        await self._broadcast_ws_message("statistics_update", stats)
+
+    async def _broadcast_request_log(self, request_data: dict):
+        """广播请求日志"""
+        if not self.websocket_clients:
+            return
+
+        await self._broadcast_ws_message("request_log", request_data)
+
+    async def _send_heartbeat(self):
+        """发送心跳"""
+        if not self.websocket_clients:
+            return
+
+        current_time = time.time()
+        if current_time - self.last_heartbeat_time >= self.heartbeat_interval:
+            await self._broadcast_ws_message("server_status", {
+                "status": "running",
+                "heartbeat": current_time,
+                "clients": len(self.websocket_clients),
+                "requests": self.statistics.total_requests,
+                "uptime": current_time - (self.start_time if hasattr(self, 'start_time') else current_time)
+            })
+            self.last_heartbeat_time = current_time
+
+    async def _heartbeat_loop(self):
+        """心跳循环"""
+        try:
+            while True:
+                await asyncio.sleep(10)  # 每10秒检查一次
+                await self._send_heartbeat()
+        except asyncio.CancelledError:
+            logging.info("心跳循环被取消")
+        except Exception as e:
+            logging.error(f"心跳循环异常: {e}")
 
 
 async def run_server(config_path: str = "config.yaml") -> None:
