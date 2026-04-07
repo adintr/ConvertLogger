@@ -335,6 +335,7 @@ class ServerManager:
         if data is None:
             data = {}
         data["action"] = command
+        logger.debug(f"发送命令: {command}, 数据: {data}")
 
         if not self.status.ws_connected:
             logger.warning(f"WebSocket未连接，无法发送命令: {command}")

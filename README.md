@@ -237,3 +237,75 @@ curl -X POST "http://localhost:8000/v1/messages?provider=anthropic_official" \
 - **请求队列管理**: 优先处理重要请求，限制并发数
 - **Webhook通知**: 关键事件（如provider故障）的实时通知
 - **CLI工具**: 提供命令行工具进行配置管理和监控
+
+## 聊天客户端
+
+项目包含两个命令行聊天客户端，可以直接与 Anthropic API 进行交互：
+
+1. **chat.py** - 使用官方 anthropic SDK，功能更完整，推荐使用
+2. **chat_httpx.py** - 使用 httpx 直接调用 API，无需额外安装 SDK
+
+### chat.py (官方SDK版本)
+
+#### 安装依赖
+```bash
+# 方法1: 单独安装 anthropic 包
+pip install anthropic
+
+# 方法2: 使用 requirements-chat.txt 文件
+pip install -r requirements-chat.txt
+```
+
+#### 使用方法
+```bash
+# 设置环境变量
+export ANTHROPIC_API_KEY=sk-ant-xxx
+
+# 运行聊天客户端
+python chat.py
+
+# 使用参数
+python chat.py --model claude-3-sonnet-20240229 --temperature 0.8
+```
+
+#### 可用命令
+- 直接输入消息与 Claude 对话
+- `/help` - 显示帮助信息
+- `/history` - 显示对话历史
+- `/clear` - 清空对话历史
+- `/exit` - 退出程序
+
+#### 命令行参数
+- `--model` - 指定模型 (默认: claude-3-haiku-20240307)
+- `--system` - 设置系统提示词
+- `--temperature` - 温度参数 (0.0-1.0, 默认: 0.7)
+- `--max-tokens` - 最大生成token数 (默认: 1000)
+- `--no-stream` - 禁用流式输出
+
+### chat_httpx.py (HTTPX版本)
+
+#### 安装依赖
+```bash
+# 安装项目所有依赖（包括 httpx）
+pip install -r requirements.txt
+```
+
+#### 使用方法
+```bash
+# 设置环境变量
+export ANTHROPIC_API_KEY=sk-ant-xxx
+
+# 运行聊天客户端
+python chat_httpx.py
+
+# 使用代理服务器
+python chat_httpx.py --proxy http://proxy.example.com:8080
+```
+
+#### 可用命令
+与 chat.py 相同
+
+#### 命令行参数
+包含 chat.py 的所有参数，额外增加：
+- `--proxy` - HTTP代理服务器地址
+

@@ -55,6 +55,14 @@ monitoring:
 
 # API提供商配置
 providers:
+  - name: "ollama"
+    enabled: true
+    type: "anthropic"
+    base_url: "http://localhost:11434"
+    api_key: "noneed"
+    models:
+      - "deepseek-coder:6.7b"
+
   # 官方Anthropic API
   - name: "anthropic_official"
     enabled: true

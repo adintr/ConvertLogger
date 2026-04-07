@@ -247,6 +247,10 @@ class APIServer:
         self.last_heartbeat_time = 0.0
         self.start_time = time.time()  # 服务器启动时间
 
+        # 默认provider和model
+        self.default_provider_name: Optional[str] = None
+        self.default_model_name: Optional[str] = None
+
         # 设置路由
         self.setup_routes()
 
@@ -284,7 +288,8 @@ class APIServer:
         优先级:
         1. X-Provider请求头
         2. provider查询参数
-        3. 第一个启用的provider
+        3. 默认provider
+        4. 第一个启用的provider
         """
         if not self.provider_clients:
             return None
@@ -303,6 +308,15 @@ class APIServer:
                 return provider_client
             else:
                 logging.warning(f"请求指定的provider不存在: {provider_name}")
+
+        # 使用默认provider
+        if self.default_provider_name:
+            provider_client = self.provider_clients.get(self.default_provider_name)
+            if provider_client:
+                logging.debug(f"使用默认provider: {self.default_provider_name}")
+                return provider_client
+            else:
+                logging.warning(f"默认provider不存在或未启用: {self.default_provider_name}")
 
         # 返回第一个可用的provider
         first_provider_name = next(iter(self.provider_clients.keys()), None)
@@ -705,6 +719,7 @@ class APIServer:
         """处理WebSocket命令"""
         action = data.get("action")
         logging.info(f"处理WebSocket命令: {action}")
+        logging.debug(f"命令数据: {data}")
 
         if action == "shutdown":
             # 优雅关闭命令
@@ -725,10 +740,51 @@ class APIServer:
             config_summary = self.config.get_config_summary()
             await self._send_ws_message(ws, "config_info", config_summary)
 
+        elif action == "set_default_provider":
+            # 设置默认provider和model
+            provider_name = data.get("provider")
+            model_name = data.get("model")
+
+            if provider_name:
+                # 验证provider存在且启用
+                if provider_name in self.provider_clients:
+                    self.default_provider_name = provider_name
+                    logging.info(f"设置默认provider为: {provider_name}")
+
+                    # 如果同时指定了model，验证该provider是否支持该model
+                    if model_name:
+                        provider = self.provider_clients[provider_name].provider
+                        if provider.is_model_supported(model_name):
+                            self.default_model_name = model_name
+                            logging.info(f"设置默认model为: {model_name}")
+                        else:
+                            logging.warning(f"Provider {provider_name} 不支持model {model_name}")
+                            self.default_model_name = None
+                    else:
+                        self.default_model_name = None
+
+                    # 发送确认消息
+                    await self._send_ws_message(ws, "command_response", {
+                        "action": "set_default_provider",
+                        "success": True,
+                        "provider": provider_name,
+                        "model": self.default_model_name,
+                        "message": f"默认provider已设置为 {provider_name}"
+                    })
+                else:
+                    await self._send_ws_message(ws, "error", {
+                        "message": f"Provider不存在或未启用: {provider_name}",
+                        "available_providers": list(self.provider_clients.keys())
+                    })
+            else:
+                await self._send_ws_message(ws, "error", {
+                    "message": "缺少provider参数"
+                })
+
         else:
             await self._send_ws_message(ws, "error", {
                 "message": f"未知命令: {action}",
-                "available_commands": ["shutdown", "get_stats", "get_config"]
+                "available_commands": ["shutdown", "get_stats", "get_config", "set_default_provider"]
             })
 
     async def _send_ws_message(self, ws: web.WebSocketResponse, msg_type: str, data: dict):
@@ -830,7 +886,7 @@ async def run_server(config_path: str = "config.yaml") -> None:
         await server.start()
 
         # 保持运行
-        print(f"服务器运行中... 按 Ctrl+C 停止")
+        print(f"服务器运行中...")
         print(f"访问 http://{config.server.host}:{config.server.port}/health 检查健康状态")
         print(f"访问 http://{config.server.host}:{config.server.port}/stats 查看统计")
 
