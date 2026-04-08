@@ -6,15 +6,16 @@ Anthropic API代理终端
 
 from textual import on
 from textual.app import App, ComposeResult
-from textual.containers import Container, Horizontal, Vertical
+from textual.containers import Container, Horizontal, Vertical, ScrollableContainer
 from textual.widgets import (
     Header, Footer, Static, RichLog,
-    DataTable, Input, Label
+    DataTable, Input, Label, TabbedContent, TabPane
 )
 from textual.binding import Binding
 from datetime import datetime
 import asyncio
 import time
+import json as json_module
 from typing import Dict, Any, List, Optional
 
 # 导入服务器管理和事件模块
@@ -126,7 +127,7 @@ class APIProxyApp(App):
                 self.update_title()
 
             elif event_type == "request_log":
-                # 显示API请求日志
+                # 显示API请求日志（操作 Tab 摘要）
                 log = self.query_one("#api-log", RichLog)
 
                 provider = event_data.get("provider", "unknown")
@@ -142,14 +143,20 @@ class APIProxyApp(App):
                 timestamp = datetime.fromtimestamp(event_data.get("timestamp", time.time())).strftime("%H:%M:%S")
 
                 log.write(f"[{status_color}]{status_icon} [{timestamp}] {provider}: {model} (HTTP {status_code}) - {response_time:.2f}s - {tokens} tokens[/{status_color}]")
+                log.scroll_end(animate=False)
 
-                # 添加到历史记录
+                # 在"请求/响应" Tab 写入详细流量信息
+                traffic_log = self.query_one("#traffic-log", RichLog)
+                self._write_traffic_log(traffic_log, event_data, timestamp, status_color, status_icon)
+
+                # 添加到历史记录（保留完整 event_data 供详情使用）
                 history_item = {
                     "time": timestamp,
                     "model": model,
                     "tokens": tokens,
                     "status": "success" if success else "failed",
-                    "provider": provider
+                    "provider": provider,
+                    "_raw": event_data,  # 保存原始数据供详情 Tab 使用
                 }
                 self.history.append(history_item)
 
@@ -162,9 +169,6 @@ class APIProxyApp(App):
                     str(tokens),
                     status_display
                 )
-
-                # 滚动到底部
-                log.scroll_end(animate=False)
 
             elif event_type == "error":
                 # 显示错误信息
@@ -211,14 +215,24 @@ class APIProxyApp(App):
 
         # 主容器：左右分割
         with Horizontal(id="main-container"):
-            # 左侧：主区域 (75%宽度)
+            # 左侧：主区域 (75%宽度) - Tab切换
             with Container(id="left-panel"):
-                yield Label("API请求/响应日志", classes="panel-title")
-                yield RichLog(id="api-log", wrap=True, highlight=True, markup=True)
-                yield Input(
-                    placeholder="输入命令 (help查看帮助)...",
-                    id="command-input"
-                )
+                with TabbedContent(id="main-tabs"):
+                    # Tab 1: 操作
+                    with TabPane("操作", id="tab-operation"):
+                        yield RichLog(id="api-log", wrap=True, highlight=True, markup=True)
+                        yield Input(
+                            placeholder="输入命令 (help查看帮助)...",
+                            id="command-input"
+                        )
+
+                    # Tab 2: 请求/响应
+                    with TabPane("请求/响应", id="tab-traffic"):
+                        yield RichLog(id="traffic-log", wrap=True, highlight=True, markup=True)
+
+                    # Tab 3: 详情
+                    with TabPane("详情", id="tab-detail"):
+                        yield RichLog(id="detail-log", wrap=True, highlight=True, markup=True)
 
             # 右侧：辅助区域 (25%宽度)
             with Vertical(id="right-panel"):
@@ -256,12 +270,181 @@ class APIProxyApp(App):
         log.write("")
         log.write(f"[bold]💡 自动启动API服务器中...[/bold]")
 
+        # 初始化请求/响应 Tab
+        traffic_log = self.query_one("#traffic-log", RichLog)
+        traffic_log.write(f"[bold cyan]📡 请求/响应实时监控[/bold cyan]")
+        traffic_log.write(f"[dim]等待服务器启动后，所有代理请求和响应将在此实时显示...[/dim]")
+        traffic_log.write(f"[dim]包含完整的 HTTP Header 和 Body 内容[/dim]")
+
+        # 初始化详情 Tab
+        detail_log = self.query_one("#detail-log", RichLog)
+        detail_log.write(f"[bold cyan]🔍 请求详情查看器[/bold cyan]")
+        detail_log.write(f"[dim]点击右侧历史记录中的任意一条，将在此处显示该请求的完整详情[/dim]")
+        detail_log.write(f"[dim]类似 Chrome DevTools → Network 面板[/dim]")
+
         # 设置焦点到命令输入框
         input_widget = self.query_one("#command-input", Input)
         input_widget.focus()
 
         # 异步启动服务器
         asyncio.create_task(self._auto_start_server())
+
+    def _write_headers(self, log: RichLog, headers: Dict[str, Any], indent: str = "    ") -> None:
+        """辅助：写入 headers，无内容时显示(无)"""
+        if headers:
+            for k, v in headers.items():
+                log.write(f"{indent}[cyan]{k}[/cyan]: {v}")
+        else:
+            log.write(f"{indent}[dim](无)[/dim]")
+
+    def _write_body(self, log: RichLog, body: Any, indent: str = "    ") -> None:
+        """辅助：写入 body，JSON 格式化，不截断"""
+        if body is None or body == "":
+            log.write(f"{indent}[dim](无)[/dim]")
+            return
+        if isinstance(body, (dict, list)):
+            try:
+                body_str = json_module.dumps(body, ensure_ascii=False, indent=2)
+            except Exception:
+                body_str = str(body)
+        else:
+            body_str = str(body)
+        for line in body_str.splitlines():
+            log.write(f"{indent}{line}")
+
+    def _write_traffic_log(self, log: RichLog, data: Dict[str, Any], timestamp: str, status_color: str, status_icon: str) -> None:
+        """在请求/响应 Tab 写入详细流量信息"""
+        provider = data.get("provider", "unknown")
+        model = data.get("model", "unknown")
+        method = data.get("method", "POST")
+        url = data.get("url", "")
+        status_code = data.get("status_code", 0)
+        response_time = data.get("response_time", 0)
+        tokens = data.get("total_tokens", 0)
+
+        log.write(f"\n[bold {status_color}]{'─' * 60}[/bold {status_color}]")
+        log.write(f"[bold {status_color}]{status_icon} [{timestamp}] {method} → {provider} | HTTP {status_code} | {response_time:.2f}s[/bold {status_color}]")
+
+        incoming_url = data.get("incoming_url", "")
+
+        # ── 1. 客户端 → 代理：原始请求 ──────────────────────────
+        log.write(f"\n[bold yellow]▶ 客户端请求 (→ 代理)[/bold yellow]")
+        log.write(f"  [dim]URL:[/dim]  {method} {incoming_url or '(未知)'}")
+        log.write(f"  [dim]模型:[/dim] {model}")
+        log.write(f"  [dim]Headers:[/dim]")
+        self._write_headers(log, data.get("incoming_headers", {}))
+        log.write(f"  [dim]Body:[/dim]")
+        self._write_body(log, data.get("request_body"))
+
+        # ── 2. 代理 → Provider：转发请求 ─────────────────────────
+        log.write(f"\n[bold cyan]▶ 转发请求 (→ {provider})[/bold cyan]")
+        log.write(f"  [dim]URL:[/dim]  {method} {url or '(未知)'}")
+        log.write(f"  [dim]Headers:[/dim]")
+        self._write_headers(log, data.get("forwarded_headers", {}))
+
+        # ── 3. Provider → 代理：响应 ─────────────────────────────
+        log.write(f"\n[bold green]◀ Provider 响应 (← {provider})[/bold green]")
+        log.write(f"  [dim]状态:[/dim]  HTTP {status_code}")
+        log.write(f"  [dim]Tokens:[/dim] {tokens}")
+        log.write(f"  [dim]Headers:[/dim]")
+        self._write_headers(log, data.get("response_headers", {}))
+        log.write(f"  [dim]Body:[/dim]")
+        self._write_body(log, data.get("response_body"))
+
+        # ── 4. 代理 → 客户端：最终响应 ───────────────────────────
+        log.write(f"\n[bold magenta]◀ 发送给客户端 (→ 原始调用方)[/bold magenta]")
+        log.write(f"  [dim]状态:[/dim]  HTTP {status_code}")
+        log.write(f"  [dim]Headers:[/dim]")
+        self._write_headers(log, data.get("client_response_headers", {}))
+        log.write(f"  [dim]Body:[/dim]")
+        self._write_body(log, data.get("client_response_body"))
+
+        error_msg = data.get("error_message")
+        if error_msg:
+            log.write(f"  [red]错误: {error_msg}[/red]")
+
+        log.scroll_end(animate=False)
+
+    def _write_detail_view(self, log: RichLog, item: Dict[str, Any]) -> None:
+        """在详情 Tab 显示类似 Chrome DevTools Network 面板的请求详情"""
+        log.clear()
+        data = item.get("_raw", {})
+        timestamp = item.get("time", "N/A")
+        provider = item.get("provider", "unknown")
+        model = item.get("model", "unknown")
+        status = item.get("status", "unknown")
+        tokens = item.get("tokens", 0)
+
+        method = data.get("method", "POST")
+        url = data.get("url", "")
+        status_code = data.get("status_code", 0)
+        response_time = data.get("response_time", 0)
+        success = data.get("success", status == "success")
+
+        status_color = "green" if success else "red"
+        status_icon = "✅" if success else "❌"
+
+        # 总览
+        log.write(f"[bold cyan]{'═' * 60}[/bold cyan]")
+        log.write(f"[bold cyan]  {status_icon} 请求详情[/bold cyan]")
+        log.write(f"[bold cyan]{'═' * 60}[/bold cyan]")
+        log.write(f"")
+        log.write(f"[bold]▍ 概览[/bold]")
+        log.write(f"  时间:       {timestamp}")
+        log.write(f"  Provider:   {provider}")
+        log.write(f"  模型:       {model}")
+        log.write(f"  状态:       [{status_color}]HTTP {status_code} ({'成功' if success else '失败'})[/{status_color}]")
+        log.write(f"  耗时:       {response_time:.3f}s")
+        log.write(f"  Tokens:     {tokens}")
+        log.write(f"  方法:       {method}")
+        incoming_url = data.get("incoming_url", "")
+        if incoming_url:
+            log.write(f"  客户端URL:  {incoming_url}")
+        if url:
+            log.write(f"  转发URL:    {url}")
+
+        # ── 1. 客户端 → 代理：原始请求 ───────────────────────────
+        log.write(f"")
+        log.write(f"[bold yellow]▍ 1. 客户端请求 Headers (→ 代理)[/bold yellow]")
+        self._write_headers(log, data.get("incoming_headers", {}), indent="  ")
+
+        log.write(f"")
+        log.write(f"[bold yellow]▍ 2. 客户端请求 Body[/bold yellow]")
+        self._write_body(log, data.get("request_body"), indent="  ")
+
+        # ── 2. 代理 → Provider：转发请求 ──────────────────────────
+        log.write(f"")
+        log.write(f"[bold cyan]▍ 3. 转发请求 Headers (→ {provider})[/bold cyan]")
+        self._write_headers(log, data.get("forwarded_headers", {}), indent="  ")
+
+        # ── 3. Provider → 代理：响应 ──────────────────────────────
+        log.write(f"")
+        log.write(f"[bold green]▍ 4. Provider 响应 Headers (← {provider})[/bold green]")
+        self._write_headers(log, data.get("response_headers", {}), indent="  ")
+
+        log.write(f"")
+        log.write(f"[bold green]▍ 5. Provider 响应 Body[/bold green]")
+        self._write_body(log, data.get("response_body"), indent="  ")
+
+        # ── 4. 代理 → 客户端：最终响应 ────────────────────────────
+        log.write(f"")
+        log.write(f"[bold magenta]▍ 6. 发送给客户端 Headers[/bold magenta]")
+        self._write_headers(log, data.get("client_response_headers", {}), indent="  ")
+
+        log.write(f"")
+        log.write(f"[bold magenta]▍ 7. 发送给客户端 Body[/bold magenta]")
+        self._write_body(log, data.get("client_response_body"), indent="  ")
+
+        # 错误信息
+        error_msg = data.get("error_message")
+        if error_msg:
+            log.write(f"")
+            log.write(f"[bold red]▍ 错误信息[/bold red]")
+            log.write(f"  [red]{error_msg}[/red]")
+
+        log.write(f"")
+        log.write(f"[bold cyan]{'═' * 60}[/bold cyan]")
+        log.scroll_begin(animate=False)
 
     def update_token_display(self) -> None:
         """更新token统计显示和服务器状态"""
@@ -330,12 +513,13 @@ class APIProxyApp(App):
             providers = self.real_time_stats.get("providers", {})
             if providers:
                 # 找出请求数最多的provider作为当前provider
-                active_providers = [p for p, stats in providers.items() if stats.get("requests", 0) > 0]
+                # providers 是 Dict[str, int]，值直接是请求数
+                active_providers = [p for p, cnt in providers.items() if (cnt if isinstance(cnt, int) else cnt.get("requests", 0)) > 0]
                 if active_providers:
-                    # 按请求数排序
+                    # 按请求数排序，providers 值是 int
                     sorted_providers = sorted(
                         active_providers,
-                        key=lambda p: providers[p].get("requests", 0),
+                        key=lambda p: providers[p] if isinstance(providers[p], int) else providers[p].get("requests", 0),
                         reverse=True
                     )
                     current_provider = sorted_providers[0]
@@ -352,18 +536,17 @@ class APIProxyApp(App):
 
     @on(DataTable.RowSelected, "#history-table")
     def on_history_row_selected(self, event: DataTable.RowSelected) -> None:
-        """处理历史记录点击事件"""
+        """处理历史记录点击事件 - 在详情 Tab 展示完整请求/响应信息"""
         if event.row_index is not None and event.row_index < len(self.history):
             history_item = self.history[event.row_index]
-            log = self.query_one("#api-log", RichLog)
-            log.write(f"\n[bold]📖 显示历史记录 #{event.row_index + 1}[/bold]")
-            log.write(f"时间: {history_item.get('time', 'N/A')}")
-            log.write(f"模型: {history_item.get('model', 'N/A')}")
-            log.write(f"Tokens: {history_item.get('tokens', 0)}")
-            log.write(f"状态: {history_item.get('status', 'unknown')}")
 
-            # 滚动到日志底部
-            log.scroll_end(animate=False)
+            # 切换到详情 Tab
+            tabs = self.query_one("#main-tabs", TabbedContent)
+            tabs.active = "tab-detail"
+
+            # 在详情 Tab 展示 Chrome DevTools 风格的详情
+            detail_log = self.query_one("#detail-log", RichLog)
+            self._write_detail_view(detail_log, history_item)
 
     @on(Input.Submitted, "#command-input")
     async def on_command_submitted(self, event: Input.Submitted) -> None:
@@ -385,8 +568,7 @@ class APIProxyApp(App):
         if command.lower() == "help":
             self.show_help()
         elif command.lower() == "clear":
-            log.clear()
-            log.write("[dim]日志已清空[/dim]")
+            self.action_clear_log()
         elif command.lower() == "stats":
             self.show_stats()
         elif command.lower() == "test":
@@ -1000,9 +1182,11 @@ class APIProxyApp(App):
         log.write("  [cyan]clear-selection[/cyan]  - 清除provider和model选择")
         log.write("")
         log.write("[bold]📊 界面说明:[/bold]")
-        log.write("  左侧: API请求/响应日志区域")
-        log.write("  右上: 服务器状态 + Token统计")
-        log.write("  右下: 历史对话记录 (点击查看详情)")
+        log.write("  左侧 [操作] Tab:     命令输入和摘要日志")
+        log.write("  左侧 [请求/响应] Tab: 完整 HTTP 请求和响应实时流（含 Header + Body）")
+        log.write("  左侧 [详情] Tab:     点击右下历史记录查看详细信息（类似 Chrome DevTools Network）")
+        log.write("  右上:               服务器状态 + Token统计")
+        log.write("  右下:               历史对话记录 (点击自动切换至详情 Tab)")
         log.write("")
         log.write("[dim]提示: 启动服务器后，API请求日志将实时显示在左侧区域[/dim]")
 
@@ -1048,10 +1232,9 @@ class APIProxyApp(App):
             log.write("")
             log.write("[bold]🏢 提供商使用统计:[/bold]")
             for provider_name, provider_stats in providers.items():
-                requests = provider_stats.get('requests', 0)
-                errors = provider_stats.get('errors', 0)
-                success_rate = 100.0 if requests == 0 else ((requests - errors) / requests) * 100
-                log.write(f"  {provider_name}: {requests} 请求, {errors} 错误 ({success_rate:.1f}% 成功率)")
+                # provider_stats 是 int（请求计数）
+                requests = provider_stats if isinstance(provider_stats, int) else provider_stats.get('requests', 0)
+                log.write(f"  {provider_name}: {requests} 请求")
 
         # 模型使用统计
         models = real_time_stats.get('models', {})
@@ -1144,8 +1327,15 @@ class APIProxyApp(App):
         log.write(f"[dim]🔄 已刷新 {datetime.now().strftime('%H:%M:%S')}[/dim]")
 
     def action_clear_log(self) -> None:
-        """清空日志"""
-        log = self.query_one("#api-log", RichLog)
+        """清空当前 Tab 的日志"""
+        tabs = self.query_one("#main-tabs", TabbedContent)
+        active = tabs.active
+        if active == "tab-traffic":
+            log = self.query_one("#traffic-log", RichLog)
+        elif active == "tab-detail":
+            log = self.query_one("#detail-log", RichLog)
+        else:
+            log = self.query_one("#api-log", RichLog)
         log.clear()
         log.write(f"[dim]🧹 日志已清空 {datetime.now().strftime('%H:%M:%S')}[/dim]")
 

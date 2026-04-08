@@ -137,12 +137,12 @@ class ProviderClient:
                              method: str,
                              path: str,
                              headers: Dict[str, str],
-                             body: Optional[bytes] = None) -> Tuple[int, Dict[str, str], bytes]:
+                             body: Optional[bytes] = None) -> Tuple[int, Dict[str, str], bytes, Dict[str, str]]:
         """
         转发请求到provider
 
         Returns:
-            Tuple[int, Dict[str, str], bytes]: (状态码, 响应头, 响应体)
+            Tuple[int, Dict[str, str], bytes, Dict[str, str]]: (状态码, 响应头, 响应体, 实际发出的请求头)
         """
         if not self.client:
             await self.initialize()
@@ -153,6 +153,10 @@ class ProviderClient:
         try:
             # 构建完整URL
             url = f"{self.provider.base_url.rstrip('/')}/{path.lstrip('/')}"
+
+            # 构建实际发出的请求头（合并client默认headers + 传入headers）
+            merged_headers = dict(self.client.headers)
+            merged_headers.update(headers)
 
             # 转发请求
             response = await self.client.request(
@@ -172,7 +176,7 @@ class ProviderClient:
             else:
                 self.error_count += 1
 
-            return response.status_code, response_headers, response_body
+            return response.status_code, response_headers, response_body, merged_headers
 
         except Exception as e:
             self.error_count += 1
@@ -186,7 +190,7 @@ class ProviderClient:
                 }
             }
 
-            return 502, {"Content-Type": "application/json"}, json.dumps(error_response).encode()
+            return 502, {"Content-Type": "application/json"}, json.dumps(error_response).encode(), {}
 
     def is_healthy(self) -> bool:
         """检查provider是否健康"""
@@ -253,6 +257,18 @@ class APIServer:
 
         # 设置路由
         self.setup_routes()
+
+    # hop-by-hop headers 不能原样转发，会导致 aiohttp 构造响应失败
+    _HOP_BY_HOP_HEADERS = frozenset([
+        "transfer-encoding", "connection", "keep-alive", "proxy-authenticate",
+        "proxy-authorization", "te", "trailers", "upgrade",
+        "content-encoding",   # httpx 已自动解压，body 是明文，不能再声明压缩
+        "content-length",     # body 长度由 aiohttp 重新计算
+    ])
+
+    def _safe_response_headers(self, headers: Dict[str, str]) -> Dict[str, str]:
+        """过滤掉不能转发给客户端的 hop-by-hop headers"""
+        return {k: v for k, v in headers.items() if k.lower() not in self._HOP_BY_HOP_HEADERS}
 
     def setup_routes(self) -> None:
         """设置HTTP路由"""
@@ -344,6 +360,12 @@ class APIServer:
             else:
                 logging.warning(f"请求指定的provider不支持模型 {model_name}: {provider_client.provider.name}")
 
+        # 优先使用用户设置的默认provider（若支持该模型）
+        if self.default_provider_name:
+            default_client = self.provider_clients.get(self.default_provider_name)
+            if default_client and default_client.provider.is_model_supported(model_name):
+                return default_client
+
         # 查找支持该模型的provider
         for client in self.provider_clients.values():
             if client.provider.is_model_supported(model_name):
@@ -432,6 +454,89 @@ class APIServer:
         config_summary = self.config.get_config_summary()
         return web.json_response(config_summary)
 
+    @staticmethod
+    def _build_sse_from_message(msg: dict) -> bytes:
+        """
+        将 Anthropic 非流式响应 JSON 转换为 SSE 事件流字节串。
+
+        Anthropic streaming 事件顺序：
+          message_start → content_block_start(×n) → ping →
+          content_block_delta(×n) → content_block_stop(×n) →
+          message_delta → message_stop
+        """
+        lines: list[str] = []
+
+        def sse(event: str, data: dict) -> None:
+            lines.append(f"event: {event}")
+            lines.append(f"data: {json.dumps(data, ensure_ascii=False)}")
+            lines.append("")  # 空行分隔
+
+        msg_id      = msg.get("id", "")
+        model_name  = msg.get("model", "")
+        usage       = msg.get("usage", {})
+        stop_reason = msg.get("stop_reason", "end_turn")
+        content     = msg.get("content", [])
+
+        # 1. message_start
+        sse("message_start", {
+            "type": "message_start",
+            "message": {
+                "id": msg_id,
+                "type": "message",
+                "role": "assistant",
+                "content": [],
+                "model": model_name,
+                "stop_reason": None,
+                "stop_sequence": None,
+                "usage": {"input_tokens": usage.get("input_tokens", 0), "output_tokens": 1},
+            }
+        })
+
+        # 2. content_block_start + delta + stop 逐块
+        for idx, block in enumerate(content):
+            block_type = block.get("type", "text")
+
+            sse("content_block_start", {
+                "type": "content_block_start",
+                "index": idx,
+                "content_block": {"type": block_type, "text": ""},
+            })
+            sse("ping", {"type": "ping"})
+
+            if block_type == "text":
+                sse("content_block_delta", {
+                    "type": "content_block_delta",
+                    "index": idx,
+                    "delta": {"type": "text_delta", "text": block.get("text", "")},
+                })
+            elif block_type == "tool_use":
+                # tool_use 块用 input_json_delta 传输 JSON 字符串
+                sse("content_block_delta", {
+                    "type": "content_block_delta",
+                    "index": idx,
+                    "delta": {
+                        "type": "input_json_delta",
+                        "partial_json": json.dumps(block.get("input", {}), ensure_ascii=False),
+                    },
+                })
+
+            sse("content_block_stop", {
+                "type": "content_block_stop",
+                "index": idx,
+            })
+
+        # 3. message_delta
+        sse("message_delta", {
+            "type": "message_delta",
+            "delta": {"stop_reason": stop_reason, "stop_sequence": None},
+            "usage": {"output_tokens": usage.get("output_tokens", 0)},
+        })
+
+        # 4. message_stop
+        sse("message_stop", {"type": "message_stop"})
+
+        return "\n".join(lines).encode("utf-8")
+
     async def handle_anthropic_request(self, request: web.Request) -> web.Response:
         """处理Anthropic API请求"""
         start_time = time.time()
@@ -443,6 +548,21 @@ class APIServer:
             # 解析JSON获取模型信息
             request_data = json.loads(body) if body else {}
             model = request_data.get("model", "unknown")
+
+            # 检测原始请求是否为流式，并记录，用于响应时还原格式
+            stream_value = request_data.get("stream")
+            client_requested_stream = (
+                stream_value is True
+                or (isinstance(stream_value, str) and stream_value.lower() == "true")
+            )
+
+            # 如果客户端要求流式，把请求改为非流式再转发给 provider
+            modified_body = body
+            if client_requested_stream:
+                modified_request_data = request_data.copy()
+                modified_request_data["stream"] = False
+                modified_body = json.dumps(modified_request_data).encode()
+                logging.info(f"检测到流式请求，改为非流式转发 provider，响应将重新封装为 SSE (model: {model})")
 
             # 选择provider
             provider_client = self.select_provider_by_model(model, request)
@@ -457,37 +577,70 @@ class APIServer:
                 }
                 return web.json_response(error_response, status=503)
 
-            # 构建转发headers
-            headers = dict(request.headers)
-
-            # 移除不需要转发的headers
-            headers_to_remove = ["host", "content-length", "connection"]
-            for header in headers_to_remove:
-                headers.pop(header, None)
+            # 构建转发headers，移除客户端认证和连接相关headers
+            # 认证header由ProviderClient初始化时配置，不应被客户端header覆盖
+            headers_to_remove = [
+                "host", "content-length", "connection",
+                "authorization", "x-api-key", "api-key",
+                "x-provider", "provider"
+            ]
+            headers = {
+                k: v for k, v in request.headers.items()
+                if k.lower() not in headers_to_remove
+            }
 
             # 转发请求
-            status_code, response_headers, response_body = await provider_client.forward_request(
+            status_code, response_headers, response_body, forwarded_headers = await provider_client.forward_request(
                 method=request.method,
                 path=request.path,
                 headers=headers,
-                body=body
+                body=modified_body
             )
 
-            # 收集统计信息
+            # 若客户端原本请求流式，将 provider 的非流式 JSON 重新封装为 SSE 格式
+            client_body = response_body
+            client_headers = self._safe_response_headers(response_headers)
+            if client_requested_stream and status_code < 400:
+                try:
+                    msg_json = json.loads(response_body)
+                    client_body = self._build_sse_from_message(msg_json)
+                    client_headers = dict(client_headers)
+                    client_headers["content-type"] = "text/event-stream; charset=utf-8"
+                    client_headers["cache-control"] = "no-cache"
+                    client_headers["x-accel-buffering"] = "no"
+                    logging.info(f"已将非流式响应重新封装为 SSE 格式，SSE 大小: {len(client_body)} 字节")
+                except Exception as e:
+                    logging.warning(f"SSE 封装失败，回退为原始响应: {e}")
+
+            # 收集统计信息（含完整请求/响应数据）
+            forwarded_url = f"{provider_client.provider.base_url.rstrip('/')}/{request.path.lstrip('/')}"
+            incoming_url = str(request.url)
             self._collect_statistics(
                 provider=provider_client.provider.name,
                 model=model,
+                method=request.method,
+                incoming_url=incoming_url,
                 request_data=request_data,
+                incoming_headers=dict(request.headers),
+                forwarded_headers=forwarded_headers,
+                forwarded_url=forwarded_url,
                 response_data=response_body,
+                response_headers=response_headers,
                 status_code=status_code,
-                response_time=time.time() - start_time
+                response_time=time.time() - start_time,
+                client_response_headers=client_headers,
+                client_response_data=client_body,
             )
 
-            # 返回响应
+            logging.info(
+                f"发送响应给客户端 - 状态码: {status_code}, SSE重封装: {client_requested_stream}, "
+                f"响应体大小: {len(client_body)} 字节, 路径: {request.path}, 模型: {model}"
+            )
+
             return web.Response(
                 status=status_code,
-                headers=response_headers,
-                body=response_body
+                headers=client_headers,
+                body=client_body
             )
 
         except json.JSONDecodeError:
@@ -497,6 +650,10 @@ class APIServer:
                     "message": "Invalid JSON in request body"
                 }
             }
+            logging.info(
+                f"发送错误响应给客户端 (JSON解析错误) - 状态码: 400, "
+                f"路径: {request.path}, 客户端: {request.remote}"
+            )
             return web.json_response(error_response, status=400)
 
         except Exception as e:
@@ -507,6 +664,10 @@ class APIServer:
                     "message": f"Internal server error: {str(e)}"
                 }
             }
+            logging.info(
+                f"发送错误响应给客户端 (服务器错误) - 状态码: 500, "
+                f"路径: {request.path}, 客户端: {request.remote}, 错误: {e}"
+            )
             return web.json_response(error_response, status=500)
 
     async def handle_proxy_request(self, request: web.Request) -> web.Response:
@@ -516,6 +677,23 @@ class APIServer:
         try:
             # 读取请求体
             body = await request.read()
+
+            # 检查并强制关闭流式响应
+            modified_body = body
+            try:
+                if body:
+                    request_data = json.loads(body)
+                    stream_value = request_data.get("stream")
+                    if stream_value is True or (isinstance(stream_value, str) and stream_value.lower() == "true"):
+                        # 复制请求数据，将stream设置为false
+                        modified_request_data = request_data.copy()
+                        modified_request_data["stream"] = False
+                        # 重新编码请求体
+                        modified_body = json.dumps(modified_request_data).encode()
+                        logging.info(f"检测到流式请求（通用代理），已强制关闭流式响应")
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                # 非JSON请求，忽略
+                pass
 
             # 选择provider（无特定模型）
             provider_client = self.select_provider_by_request(request)
@@ -529,37 +707,67 @@ class APIServer:
                 }
                 return web.json_response(error_response, status=503)
 
-            # 构建转发headers
-            headers = dict(request.headers)
-
-            # 移除不需要转发的headers
-            headers_to_remove = ["host", "content-length", "connection"]
-            for header in headers_to_remove:
-                headers.pop(header, None)
+            # 构建转发headers，移除客户端认证和连接相关headers
+            headers_to_remove = [
+                "host", "content-length", "connection",
+                "authorization", "x-api-key", "api-key",
+                "x-provider", "provider"
+            ]
+            headers = {
+                k: v for k, v in request.headers.items()
+                if k.lower() not in headers_to_remove
+            }
 
             # 转发请求
-            status_code, response_headers, response_body = await provider_client.forward_request(
+            status_code, response_headers, response_body, forwarded_headers = await provider_client.forward_request(
                 method=request.method,
                 path=request.path_qs,
                 headers=headers,
-                body=body
+                body=modified_body
             )
 
-            # 简单统计（无法解析具体模型）
-            stats = RequestStatistics(
-                timestamp=start_time,
-                provider_name=provider_client.provider.name,
+            # 统计
+            forwarded_url = f"{provider_client.provider.base_url.rstrip('/')}/{request.path_qs.lstrip('/')}"
+            try:
+                request_body = json.loads(body) if body else {}
+            except Exception:
+                request_body = body.decode("utf-8", errors="replace") if body else ""
+            safe_headers = self._safe_response_headers(response_headers)
+            self._collect_statistics(
+                provider=provider_client.provider.name,
                 model="unknown",
-                response_time=time.time() - start_time,
+                method=request.method,
+                incoming_url=str(request.url),
+                request_data=request_body if isinstance(request_body, dict) else {},
+                incoming_headers=dict(request.headers),
+                forwarded_headers=forwarded_headers,
+                forwarded_url=forwarded_url,
+                response_data=response_body,
+                response_headers=response_headers,
                 status_code=status_code,
-                success=status_code < 400
+                response_time=time.time() - start_time,
+                client_response_headers=safe_headers,
             )
-            self.statistics.add_request(stats)
+
+            # 记录发送给客户端的响应
+            logging.info(
+                f"发送响应给客户端 (通用代理) - 状态码: {status_code}, "
+                f"响应头数量: {len(safe_headers)}, "
+                f"响应体大小: {len(response_body) if response_body else 0} 字节, "
+                f"路径: {request.path}, 方法: {request.method}"
+            )
+            if len(response_body) < 1000:  # 只记录较小的响应体
+                try:
+                    response_text = response_body.decode('utf-8', errors='replace')
+                    if response_text:
+                        logging.debug(f"响应体内容: {response_text[:500]}")
+                except Exception:
+                    pass
 
             # 返回响应
             return web.Response(
                 status=status_code,
-                headers=response_headers,
+                headers=safe_headers,
                 body=response_body
             )
 
@@ -571,50 +779,55 @@ class APIServer:
                     "message": f"Internal server error: {str(e)}"
                 }
             }
+            logging.info(
+                f"发送错误响应给客户端 (通用代理错误) - 状态码: 500, "
+                f"路径: {request.path}, 客户端: {request.remote}, 错误: {e}"
+            )
             return web.json_response(error_response, status=500)
 
     def _collect_statistics(self,
                            provider: str,
                            model: str,
+                           method: str,
+                           incoming_url: str,
                            request_data: Dict[str, Any],
+                           incoming_headers: Dict[str, str],
+                           forwarded_headers: Dict[str, str],
+                           forwarded_url: str,
                            response_data: bytes,
+                           response_headers: Dict[str, str],
                            status_code: int,
-                           response_time: float) -> None:
-        """收集请求统计信息"""
+                           response_time: float,
+                           client_response_headers: Optional[Dict[str, str]] = None,
+                           client_response_data: Optional[bytes] = None) -> None:
+        """收集请求统计信息并广播完整流量数据"""
         try:
-            # 尝试从请求中提取token数量
+            # 从响应中提取token数量
             prompt_tokens = 0
             completion_tokens = 0
+            response_json = None
 
-            # 从Anthropic请求中提取
-            if "messages" in request_data:
-                # 简单估算：每个消息10个token
-                prompt_tokens = len(request_data["messages"]) * 10
-            elif "prompt" in request_data:
-                # 简单估算：每4个字符约1个token
-                prompt_text = str(request_data["prompt"])
-                prompt_tokens = len(prompt_text) // 4
-
-            # 尝试从响应中提取token数量
             if response_data:
                 try:
                     response_json = json.loads(response_data)
-
-                    # Anthropic响应格式
                     if "usage" in response_json:
                         usage = response_json["usage"]
-                        prompt_tokens = usage.get("input_tokens", prompt_tokens)
+                        prompt_tokens = usage.get("input_tokens", 0)
                         completion_tokens = usage.get("output_tokens", 0)
-
-                    # OpenAI兼容格式
                     elif "choices" in response_json and len(response_json["choices"]) > 0:
                         choice = response_json["choices"][0]
                         if "message" in choice:
-                            # 简单估算响应token
                             message_text = str(choice["message"].get("content", ""))
                             completion_tokens = len(message_text) // 4
-                except:
+                except Exception:
                     pass
+
+            # 从请求中估算（无法从响应获取时）
+            if prompt_tokens == 0:
+                if "messages" in request_data:
+                    prompt_tokens = len(request_data["messages"]) * 10
+                elif "prompt" in request_data:
+                    prompt_tokens = len(str(request_data["prompt"])) // 4
 
             total_tokens = prompt_tokens + completion_tokens
 
@@ -632,18 +845,45 @@ class APIServer:
 
             self.statistics.add_request(stats)
 
-            # 广播请求日志
+            # 脱敏处理：隐藏认证相关header的值
+            sensitive_keys = {"authorization", "x-api-key", "api-key"}
+
+            def mask_headers(hdrs: Dict[str, str]) -> Dict[str, str]:
+                return {
+                    k: ("***" if k.lower() in sensitive_keys else v)
+                    for k, v in hdrs.items()
+                }
+
+            # 广播完整流量数据
             try:
                 log_data = {
                     "provider": provider,
                     "model": model,
+                    "method": method,
+                    "incoming_url": incoming_url,
+                    "url": forwarded_url,
                     "status_code": status_code,
                     "success": status_code < 400,
                     "response_time": response_time,
                     "prompt_tokens": prompt_tokens,
                     "completion_tokens": completion_tokens,
                     "total_tokens": total_tokens,
-                    "timestamp": time.time()
+                    "timestamp": time.time(),
+                    # 客户端发来的原始请求
+                    "incoming_headers": mask_headers(incoming_headers),
+                    "request_body": request_data,
+                    # 转发给 provider 的请求
+                    "forwarded_headers": mask_headers(forwarded_headers),
+                    # provider 返回的响应
+                    "response_headers": dict(response_headers),
+                    "response_body": response_json if response_json is not None else response_data.decode("utf-8", errors="replace"),
+                    # 发送给客户端的响应（过滤后的 headers，SSE 重封装时内容不同于 provider 响应）
+                    "client_response_headers": dict(client_response_headers) if client_response_headers else {},
+                    "client_response_body": (
+                        client_response_data.decode("utf-8", errors="replace")
+                        if client_response_data is not None
+                        else (response_json if response_json is not None else response_data.decode("utf-8", errors="replace"))
+                    ),
                 }
                 asyncio.create_task(self._broadcast_request_log(log_data))
             except Exception as log_error:
