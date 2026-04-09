@@ -5,7 +5,7 @@ Anthropic API 类型处理
 """
 import json
 import logging
-from typing import Dict, Optional, Tuple, TYPE_CHECKING
+from typing import Dict, List, Optional, Tuple, TYPE_CHECKING
 
 import httpx
 
@@ -24,6 +24,26 @@ def get_default_headers(provider: "ProviderConfig") -> Dict[str, str]:
     if provider.headers:
         headers.update(provider.headers)
     return headers
+
+
+async def list_models(provider: "ProviderConfig") -> List[str]:
+    """查询 Anthropic 可用模型列表"""
+    import httpx as _httpx
+    url = f"{provider.base_url.rstrip('/')}/v1/models"
+    headers = {
+        "x-api-key": provider.api_key,
+        "anthropic-version": "2023-06-01",
+    }
+    try:
+        async with _httpx.AsyncClient(timeout=30) as client:
+            resp = await client.get(url, headers=headers)
+            resp.raise_for_status()
+            data = resp.json()
+            # {"data": [{"id": "claude-...", ...}, ...]}
+            return [m["id"] for m in data.get("data", []) if "id" in m]
+    except Exception as e:
+        logging.error(f"Anthropic 查询模型列表失败 (provider={provider.name}): {e}")
+        raise
 
 
 async def forward_request(

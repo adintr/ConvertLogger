@@ -21,7 +21,7 @@ Gemini API 类型处理
 import json
 import logging
 import uuid
-from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
+from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING  # noqa: F401
 
 import httpx
 
@@ -169,6 +169,23 @@ def get_default_headers(provider: "ProviderConfig") -> Dict[str, str]:
         "Content-Type": "application/json",
         "User-Agent": "Anthropic-API-Proxy/1.0",
     }
+
+
+async def list_models(provider: "ProviderConfig") -> List[str]:
+    """查询 Gemini 可用模型列表"""
+    gemini_client = genai.Client(api_key=provider.api_key)
+    try:
+        models = []
+        async for m in await gemini_client.aio.models.list():
+            name = getattr(m, "name", "") or ""
+            # name 形如 "models/gemini-2.0-flash"，取最后一段
+            model_id = name.split("/")[-1] if "/" in name else name
+            if model_id:
+                models.append(model_id)
+        return models
+    except Exception as e:
+        logging.error(f"Gemini 查询模型列表失败 (provider={provider.name}): {e}")
+        raise
 
 
 async def forward_request(

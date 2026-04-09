@@ -372,6 +372,18 @@ class ServerManager:
             # 请求日志
             await self._emit_event("request_log", msg_data)
 
+        elif msg_type == "providers_info":
+            # provider 列表信息
+            await self._emit_event("providers_info", msg_data)
+
+        elif msg_type == "command_response":
+            # 命令响应
+            await self._emit_event("command_response", msg_data)
+
+        elif msg_type == "config_reloaded":
+            # 广播：配置已重载
+            await self._emit_event("config_reloaded", msg_data)
+
         elif msg_type == "error":
             # 错误消息
             await self._emit_event("error", msg_data)
@@ -433,7 +445,7 @@ if __name__ == "__main__":
             await asyncio.sleep(5)
 
             print("\n2. 发送测试命令...")
-            cmd_id = await manager.send_command("get_stats")
+            cmd_id = await manager.send_command("get stats")
             print(f"命令发送，ID: {cmd_id}")
 
             await asyncio.sleep(3)

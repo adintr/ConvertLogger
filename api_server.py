@@ -151,17 +151,6 @@ class ProviderClient:
 
         return status_code, response_headers, response_body, merged_headers
 
-    def is_healthy(self) -> bool:
-        """检查provider是否健康"""
-        return self.error_count < 5
-
-    def get_weight(self) -> int:
-        """获取当前权重（考虑健康状态）"""
-        base_weight = self.provider.weight
-        if not self.is_healthy():
-            return max(1, base_weight // 2)
-        return base_weight
-
 
 class APIServer:
     """API代理服务器"""
@@ -341,6 +330,198 @@ class APIServer:
         self._heartbeat_task = asyncio.create_task(self._heartbeat_loop())
         logging.info("心跳任务已启动")
 
+    async def _update_provider_models(self, provider_name: str) -> Dict[str, Any]:
+        """
+        向指定 provider 查询可用模型列表，并将结果同步到内存配置和 config.yaml。
+
+        Returns:
+            {"success": True, "models": [...]} 或 {"success": False, "error": "..."}
+        """
+        client = self.provider_clients.get(provider_name)
+        if not client:
+            return {"success": False, "error": f"provider '{provider_name}' 不存在或未启用"}
+
+        type_module = client._type_module
+        if not hasattr(type_module, "list_models"):
+            return {"success": False, "error": f"provider 类型 '{client.provider.type}' 不支持查询模型列表"}
+
+        p = client.provider
+        provider_type = p.type
+        start_time = time.time()
+
+        # 构建用于 traffic log 的请求信息
+        if provider_type == "gemini":
+            # Gemini 使用 SDK，无直接 HTTP URL
+            request_url = f"[Gemini SDK] models.list (api_key=***)"
+            request_headers: Dict[str, str] = {}
+            request_body: Dict[str, Any] = {"sdk": "google-genai", "action": "models.list"}
+        else:
+            # anthropic / openai 兼容型
+            request_url = f"{p.base_url.rstrip('/')}/v1/models"
+            request_headers = {"x-api-key": "***", "anthropic-version": "2023-06-01"} \
+                if provider_type == "anthropic" else {"Authorization": "Bearer ***"}
+            request_body = {}
+
+        try:
+            models = await type_module.list_models(p)
+            elapsed = time.time() - start_time
+            status_code = 200
+            error_msg = ""
+        except Exception as e:
+            elapsed = time.time() - start_time
+            status_code = 502
+            error_msg = str(e)
+            # 广播失败的 traffic log
+            log_data = {
+                "provider": provider_name,
+                "model": "list_models",
+                "method": "GET",
+                "incoming_url": f"[内部] update models {provider_name}",
+                "url": request_url,
+                "status_code": status_code,
+                "success": False,
+                "response_time": elapsed,
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "total_tokens": 0,
+                "timestamp": time.time(),
+                "incoming_headers": {},
+                "request_body": request_body,
+                "forwarded_headers": request_headers,
+                "response_headers": {},
+                "response_body": {"error": error_msg},
+                "client_response_headers": {},
+                "client_response_body": {"error": error_msg},
+                "error_message": error_msg,
+            }
+            asyncio.create_task(self._broadcast_request_log(log_data))
+            return {"success": False, "error": error_msg}
+
+        # 广播成功的 traffic log
+        response_body_data: Any = {"models": models, "count": len(models)}
+        log_data = {
+            "provider": provider_name,
+            "model": "list_models",
+            "method": "GET",
+            "incoming_url": f"[内部] update models {provider_name}",
+            "url": request_url,
+            "status_code": status_code,
+            "success": True,
+            "response_time": elapsed,
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+            "timestamp": time.time(),
+            "incoming_headers": {},
+            "request_body": request_body,
+            "forwarded_headers": request_headers,
+            "response_headers": {"content-type": "application/json"},
+            "response_body": response_body_data,
+            "client_response_headers": {},
+            "client_response_body": response_body_data,
+        }
+        asyncio.create_task(self._broadcast_request_log(log_data))
+
+        if not models:
+            return {"success": False, "error": "查询结果为空，未更新配置"}
+
+        try:
+            self.config.update_provider_models(provider_name, models)
+        except Exception as e:
+            return {"success": False, "error": f"写入配置失败: {e}"}
+
+        logging.info(f"已更新 provider '{provider_name}' 模型列表: {models}")
+        return {"success": True, "models": models}
+
+    async def reload_config(self) -> Dict[str, Any]:
+        """
+        热重载配置文件中的 providers 和 schemes 部分。
+        不停止监听端口，不断开任何已连接的客户端。
+        返回重载结果摘要。
+        """
+        try:
+            new_config = load_config(self.config.config_path)
+        except Exception as e:
+            logging.error(f"重载配置失败: {e}")
+            return {"success": False, "error": str(e)}
+
+        # ---- providers ----
+        new_enabled = {p.name: p for p in new_config.get_enabled_providers()}
+        old_names = set(self.provider_clients.keys())
+        new_names = set(new_enabled.keys())
+
+        # 关闭已删除/禁用的 provider 客户端
+        removed = old_names - new_names
+        for name in removed:
+            await self.provider_clients[name].close()
+            del self.provider_clients[name]
+            logging.info(f"热重载: 移除 provider '{name}'")
+
+        # 新增的 provider 客户端
+        added = new_names - old_names
+        for name in added:
+            client = ProviderClient(new_enabled[name], new_config)
+            await client.initialize()
+            self.provider_clients[name] = client
+            logging.info(f"热重载: 添加 provider '{name}'")
+
+        # 更新已存在的 provider 配置（重建客户端以刷新认证/代理等）
+        updated = old_names & new_names
+        for name in updated:
+            old_client = self.provider_clients[name]
+            await old_client.close()
+            client = ProviderClient(new_enabled[name], new_config)
+            await client.initialize()
+            # 保留统计计数
+            client.request_count = old_client.request_count
+            client.error_count = old_client.error_count
+            self.provider_clients[name] = client
+            logging.info(f"热重载: 更新 provider '{name}'")
+
+        # ---- schemes ----
+        new_config.providers = list(new_config.providers)  # 保持引用完整
+        self.config.schemes = new_config.schemes
+        self.config.default_scheme = new_config.default_scheme
+
+        # 更新 config 中的 providers（供 select_provider_by_scheme 使用的 config.get_default_scheme）
+        self.config.providers = new_config.providers
+        self.config.raw_config = new_config.raw_config
+
+        # 检查当前选中的方案是否仍存在
+        if self.current_scheme_name:
+            if not any(s.name == self.current_scheme_name for s in self.config.schemes):
+                old_scheme = self.current_scheme_name
+                self.current_scheme_name = None  # 回退到 default_scheme
+                logging.warning(
+                    f"热重载: 当前方案 '{old_scheme}' 不再存在，"
+                    f"已回退到默认方案 '{self.config.default_scheme}'"
+                )
+                scheme_fallback = old_scheme
+            else:
+                scheme_fallback = None
+        else:
+            scheme_fallback = None
+
+        result = {
+            "success": True,
+            "providers": {
+                "added": list(added),
+                "removed": list(removed),
+                "updated": list(updated),
+                "total": len(self.provider_clients),
+            },
+            "schemes": {
+                "total": len(self.config.schemes),
+                "default": self.config.default_scheme,
+                "current": self.current_scheme_name,
+            },
+        }
+        if scheme_fallback:
+            result["scheme_fallback"] = scheme_fallback
+
+        logging.info(f"热重载完成: {result}")
+        return result
+
     async def stop(self) -> None:
         """停止服务器"""
         # 关闭provider客户端
@@ -385,8 +566,6 @@ class APIServer:
             provider_details[name] = {
                 "request_count": client.request_count,
                 "error_count": client.error_count,
-                "healthy": client.is_healthy(),
-                "weight": client.get_weight()
             }
 
         stats["providers_detail"] = provider_details
@@ -919,17 +1098,38 @@ class APIServer:
             # 在实际实现中，这里应该触发服务器关闭流程
             logging.info("收到关闭命令")
 
-        elif action == "get_stats":
+        elif action == "get stats":
             # 获取统计信息
             stats = self.statistics.get_summary()
             await self._send_ws_message(ws, "statistics_update", stats)
 
-        elif action == "get_config":
+        elif action == "get config":
             # 获取配置信息
             config_summary = self.config.get_config_summary()
             await self._send_ws_message(ws, "config_info", config_summary)
 
-        elif action == "set_scheme":
+        elif action == "reload":
+            # 热重载 providers 和 schemes
+            result = await self.reload_config()
+            if result["success"]:
+                await self._send_ws_message(ws, "command_response", {
+                    "action": "reload",
+                    "success": True,
+                    "message": "配置已热重载",
+                    **result,
+                })
+                # 广播通知所有客户端配置已变更
+                await self._broadcast_ws_message("config_reloaded", {
+                    "providers": result["providers"],
+                    "schemes": result["schemes"],
+                })
+            else:
+                await self._send_ws_message(ws, "error", {
+                    "message": f"热重载失败: {result.get('error')}",
+                    "action": "reload",
+                })
+
+        elif action == "set scheme":
             # 切换当前转发方案
             scheme_name = data.get("scheme")
             if scheme_name:
@@ -938,7 +1138,7 @@ class APIServer:
                     self.current_scheme_name = scheme_name
                     logging.info(f"切换转发方案为: {scheme_name}")
                     await self._send_ws_message(ws, "command_response", {
-                        "action": "set_scheme",
+                        "action": "set scheme",
                         "success": True,
                         "scheme": scheme_name,
                         "message": f"转发方案已切换为 {scheme_name}"
@@ -953,10 +1153,57 @@ class APIServer:
                     "message": "缺少 scheme 参数"
                 })
 
+        elif action == "list providers":
+            # 返回所有 provider 的详细信息（不含 api_key）
+            providers_info = []
+            for name, client in self.provider_clients.items():
+                p = client.provider
+                providers_info.append({
+                    "name": p.name,
+                    "type": p.type,
+                    "enabled": p.enabled,
+                    "base_url": p.base_url,
+                    "models": p.models,
+                    "timeout": p.timeout,
+                    "proxy_enabled": p.proxy_enabled,
+                    "proxy_url": p.proxy_url if p.proxy_enabled else None,
+                    "request_count": client.request_count,
+                    "error_count": client.error_count,
+                })
+            await self._send_ws_message(ws, "providers_info", {
+                "providers": providers_info,
+                "total": len(providers_info),
+            })
+
+        elif action == "update models":
+            # 向 provider 查询可用模型列表，并同步到配置
+            provider_name = data.get("provider")
+            if not provider_name:
+                await self._send_ws_message(ws, "error", {
+                    "message": "缺少 provider 参数",
+                    "action": "update models",
+                })
+            else:
+                result = await self._update_provider_models(provider_name)
+                if result["success"]:
+                    await self._send_ws_message(ws, "command_response", {
+                        "action": "update models",
+                        "success": True,
+                        "provider": provider_name,
+                        "models": result["models"],
+                        "message": f"已更新 provider '{provider_name}' 的模型列表，共 {len(result['models'])} 个模型",
+                    })
+                else:
+                    await self._send_ws_message(ws, "error", {
+                        "action": "update models",
+                        "message": result.get("error", "未知错误"),
+                        "provider": provider_name,
+                    })
+
         else:
             await self._send_ws_message(ws, "error", {
                 "message": f"未知命令: {action}",
-                "available_commands": ["shutdown", "get_stats", "get_config", "set_scheme"]
+                "available_commands": ["shutdown", "get stats", "get config", "set scheme", "reload", "update models", "list providers"]
             })
 
     async def _send_ws_message(self, ws: web.WebSocketResponse, msg_type: str, data: dict):

@@ -5,7 +5,7 @@ OpenAI API 类型处理
 """
 import json
 import logging
-from typing import Dict, Optional, Tuple, TYPE_CHECKING
+from typing import Dict, List, Optional, Tuple, TYPE_CHECKING
 
 import httpx
 
@@ -26,6 +26,29 @@ def get_default_headers(provider: "ProviderConfig") -> Dict[str, str]:
     if provider.api_version:
         headers["api-version"] = provider.api_version
     return headers
+
+
+async def list_models(provider: "ProviderConfig") -> List[str]:
+    """查询 OpenAI 兼容 API 可用模型列表"""
+    import httpx as _httpx
+    url = f"{provider.base_url.rstrip('/')}/v1/models"
+    auth_headers = provider.get_auth_header()
+    headers = {**auth_headers}
+    if provider.api_version:
+        headers["api-version"] = provider.api_version
+    params = {}
+    if provider.api_version:
+        params["api-version"] = provider.api_version
+    try:
+        async with _httpx.AsyncClient(timeout=30) as client:
+            resp = await client.get(url, headers=headers, params=params)
+            resp.raise_for_status()
+            data = resp.json()
+            # {"data": [{"id": "gpt-4o", ...}, ...]}
+            return [m["id"] for m in data.get("data", []) if "id" in m]
+    except Exception as e:
+        logging.error(f"OpenAI 查询模型列表失败 (provider={provider.name}): {e}")
+        raise
 
 
 async def forward_request(

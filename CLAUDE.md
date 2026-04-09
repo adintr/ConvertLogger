@@ -78,16 +78,15 @@ add       # Add test history
 The project uses YAML-based configuration for managing multiple API providers:
 
 ### Configuration Files
-- `config.yaml` - Main configuration file with providers, routing rules, and server settings
+- `config.yaml` - Main configuration file with providers and server settings
 - `.env` - Environment variables for API keys (optional, referenced in config.yaml)
 
 ### Key Configuration Sections
 1. **Server Configuration** - Host, port, timeout settings
-2. **Provider Configuration** - Multiple API providers with authentication, models, and limits
-3. **HTTP Proxy Configuration** - Global and per-provider proxy settings with authentication support
-4. **Routing Rules** - Model-based and parameter-based routing
+2. **Provider Configuration** - Multiple API providers with authentication and models
+3. **Per-Provider HTTP Proxy** - Proxy settings per provider with authentication support
+4. **Forwarding Schemes** - Model-to-provider routing via named schemes
 5. **Manual Provider Selection** - Manual provider selection via headers or URL parameters
-6. **Retry Configuration** - Automatic retry logic for failed requests
 
 ### Provider Configuration Example
 ```yaml
@@ -100,20 +99,12 @@ providers:
     models:
       - "claude-3-opus-20240229"
       - "claude-3-sonnet-20240229"
-    weight: 10
     timeout: 60
 ```
 
 ### Proxy Configuration Example
 ```yaml
-# Global proxy settings
-proxy:
-  enabled: true
-  url: "http://proxy.example.com:8080"
-  auth: "${PROXY_USER}:${PROXY_PASS}"
-  bypass_local: true
-
-# Provider-specific proxy (overrides global)
+# Provider-specific proxy
 providers:
   - name: "third_party_proxy"
     proxy_enabled: true
@@ -157,10 +148,31 @@ Instead of load balancing, the system supports manual provider selection:
 2. **Via URL Parameter**: Add `?provider=provider_name` to request URL
 3. **Automatic Fallback**: If no provider specified, uses first provider supporting the requested model
 
-### Provider Health Checks
-- Each provider tracks error counts and request counts
-- Unhealthy providers (error_count >= 5) are not automatically selected
-- Manual provider selection can override health checks
+### WebSocket Commands
+Connect to `ws://<host>:<port>/ws` and send JSON messages in the format:
+```json
+{"type": "command", "data": {"action": "<action>", ...}}
+```
+
+| action | 参数 | 说明 |
+|--------|------|------|
+| `shutdown` | — | 触发优雅关闭 |
+| `get stats` | — | 返回请求统计摘要 |
+| `get config` | — | 返回配置摘要 |
+| `set scheme` | `scheme` (string) | 切换当前转发方案 |
+| `reload` | — | 热重载 providers 和 schemes，不停止监听端口 |
+| `update models` | `provider` (string) | 向指定 provider 查询可用模型列表并同步到 config.yaml |
+
+**`update models` 说明：**
+- 调用各 provider 类型模块的 `list_models()` 函数向上游 API 获取模型列表
+- 获取成功后同时更新内存配置和 config.yaml 文件中对应 provider 的 `models` 字段
+- Anthropic 类型调用 `/v1/models`；OpenAI 兼容类型调用 `/v1/models`；Gemini 类型使用 `google-genai` SDK 的 `models.list()`
+- 查询结果为空时不更新配置
+
+```json
+// 示例：更新 anthropic_official 的模型列表
+{"type": "command", "data": {"action": "update models", "provider": "anthropic_official"}}
+```
 
 ### Starting the Server
 ```bash
@@ -192,9 +204,9 @@ Current implementation includes:
 ### Completed
 1. Terminal UI with three-panel layout (Textual)
 2. YAML-based configuration system with environment variable support
-3. HTTP proxy support for accessing providers
-4. API proxy server with manual provider selection
-5. Statistics collection and health monitoring
+3. Per-provider HTTP proxy support
+4. API proxy server with scheme-based routing and manual provider selection
+5. Statistics collection
 
 ### Pending Integration
 1. Connect terminal UI with API server for real-time logging

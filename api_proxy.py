@@ -167,6 +167,54 @@ class APIProxyApp(App):
                     status_display
                 )
 
+            elif event_type == "providers_info":
+                # 显示 provider 详情列表
+                log = self.query_one("#api-log", RichLog)
+                providers = event_data.get("providers", [])
+                total = event_data.get("total", len(providers))
+                log.write(f"\n[bold]📋 Provider 列表 (共{total}个):[/bold]")
+                for p in providers:
+                    status_icon = "🟢" if p.get("enabled") else "🔴"
+                    log.write(f"\n  {status_icon} [bold cyan]{p['name']}[/bold cyan]  (type: {p['type']})")
+                    log.write(f"     base_url:  {p.get('base_url', 'N/A')}")
+                    if p.get("proxy_enabled"):
+                        log.write(f"     proxy:     {p.get('proxy_url', 'N/A')}")
+                    log.write(f"     timeout:   {p.get('timeout', 'N/A')}s")
+                    log.write(f"     请求次数:  {p.get('request_count', 0)}  错误次数: {p.get('error_count', 0)}")
+                    models = p.get("models", [])
+                    if models:
+                        log.write(f"     模型列表 ({len(models)} 个):")
+                        for m in models:
+                            log.write(f"       - {m}")
+                    else:
+                        log.write(f"     模型列表: [dim](未配置)[/dim]")
+
+            elif event_type == "command_response":
+                action = event_data.get("action", "")
+                if action == "reload":
+                    log = self.query_one("#api-log", RichLog)
+                    providers = event_data.get("providers", {})
+                    schemes = event_data.get("schemes", {})
+                    added = providers.get("added", [])
+                    removed = providers.get("removed", [])
+                    updated = providers.get("updated", [])
+                    log.write(f"[green]✅ 热重载完成[/green]  providers总计: {providers.get('total', '?')}  schemes总计: {schemes.get('total', '?')} (默认: {schemes.get('default', 'N/A')})")
+                    if added:
+                        log.write(f"   [green]新增 provider:[/green] {', '.join(added)}")
+                    if removed:
+                        log.write(f"   [red]移除 provider:[/red] {', '.join(removed)}")
+                    if updated:
+                        log.write(f"   [cyan]更新 provider:[/cyan] {', '.join(updated)}")
+                    if not added and not removed and not updated:
+                        log.write(f"   [dim]配置无变化[/dim]")
+                    fallback = event_data.get("scheme_fallback")
+                    if fallback:
+                        log.write(f"   [yellow]⚠️  当前方案 '{fallback}' 已失效，已回退到默认方案[/yellow]")
+
+            elif event_type == "config_reloaded":
+                # 广播消息（其他 WebSocket 客户端收到），本客户端已由 command_response 处理，忽略
+                pass
+
             elif event_type == "error":
                 # 显示错误信息
                 log = self.query_one("#api-log", RichLog)
@@ -202,7 +250,7 @@ class APIProxyApp(App):
                 log.write(f"[dim]提示: 服务器已自动启动，您可以直接开始测试[/dim]")
             else:
                 log.write(f"[red]❌ API服务器启动失败[/red]")
-                log.write(f"[dim]您仍可以手动输入 'start-server' 尝试启动[/dim]")
+                log.write(f"[dim]您仍可以手动输入 'start server' 尝试启动[/dim]")
         except Exception as e:
             log.write(f"[red]❌ 启动服务器时发生错误: {e}[/red]")
 
@@ -584,27 +632,40 @@ class APIProxyApp(App):
                 log.write(f"[dim]当前不在选择模式[/dim]")
 
         # 服务器控制命令
-        elif command.lower() == "start-server":
+        elif command.lower() == "start server":
             await self._handle_start_server()
-        elif command.lower() == "stop-server":
+        elif command.lower() == "stop server":
             await self._handle_stop_server()
-        elif command.lower() == "restart-server":
+        elif command.lower() == "restart server":
             await self._handle_restart_server()
-        elif command.lower() == "server-status":
+        elif command.lower() == "server status":
             await self._handle_server_status()
-        elif command.lower() == "server-info":
+        elif command.lower() == "server info":
             await self._handle_server_info()
+        elif command.lower() == "reload":
+            await self._handle_reload(log)
 
         # 方案选择命令
-        elif command.lower() == "list-schemes":
+        elif command.lower() == "list schemes":
             await self._handle_list_schemes(log)
-        elif command.lower() == "current-scheme":
+        elif command.lower() == "current scheme":
             await self._handle_current_scheme(log)
-        elif command.lower() == "select-scheme":
+        elif command.lower() == "select scheme":
             await self._handle_select_scheme_interactive(log)
-        elif command.lower().startswith("select-scheme "):
-            scheme_name = command[len("select-scheme "):].strip()
+        elif command.lower().startswith("select scheme "):
+            scheme_name = command[len("select scheme "):].strip()
             await self._handle_select_scheme(scheme_name, log)
+
+        # provider 命令
+        elif command.lower() == "list providers":
+            await self._handle_list_providers(log)
+
+        # 模型更新命令
+        elif command.lower().startswith("update models "):
+            provider_name = command[len("update models "):].strip()
+            await self._handle_update_models(provider_name, log)
+        elif command.lower() == "update models":
+            log.write(f"[yellow]⚠️  请指定 provider 名称，例如: update models anthropic_official[/yellow]")
 
         else:
             log.write(f"[yellow]❓ 未知命令: {command}[/yellow]")
@@ -626,7 +687,7 @@ class APIProxyApp(App):
                 marker = "[bold green]*[/bold green] " if scheme.name == current_name else "  "
                 log.write(f"  {marker}[bold]{scheme.name}[/bold]  {scheme.description}")
 
-            log.write(f"\n[dim]使用 'select-scheme <name>' 或 'select-scheme' 切换方案[/dim]")
+            log.write(f"\n[dim]使用 'select scheme <name>' 或 'select scheme' 切换方案[/dim]")
         except Exception as e:
             log.write(f"[red]❌ 列出方案时发生错误: {e}[/red]")
 
@@ -655,7 +716,7 @@ class APIProxyApp(App):
             log.write(f"[red]❌ 获取方案信息时发生错误: {e}[/red]")
 
     async def _handle_select_scheme_interactive(self, log: RichLog) -> None:
-        """不带参数的 select-scheme：交互式列表选择"""
+        """不带参数的 select scheme：交互式列表选择"""
         try:
             config = load_config(self.server_manager.config_path)
             if not config.schemes:
@@ -671,7 +732,7 @@ class APIProxyApp(App):
                 marker = "[green]*[/green] " if scheme.name == current_name else "  "
                 log.write(f"  {marker}[bold][{i}][/bold] {scheme.name}  {scheme.description}")
 
-            log.write(f"\n[dim]输入 1-{len(config.schemes)} 选择，或输入 'cancel' 取消[/dim]")
+            log.write(f"\n[dim]输入 1-{len(config.schemes)} 选择，或输入 'cancel' 取消[/dim]")  # cancel 无连字符，保持不变
             input_widget = self.query_one("#command-input", Input)
             input_widget.placeholder = f"输入序号 (1-{len(config.schemes)})..."
         except Exception as e:
@@ -696,7 +757,7 @@ class APIProxyApp(App):
 
             # 同步到服务器
             if self.server_status["ws_connected"]:
-                cmd_id = await self.server_manager.send_command("set_scheme", {"scheme": scheme.name})
+                cmd_id = await self.server_manager.send_command("set scheme", {"scheme": scheme.name})
                 if cmd_id:
                     log.write(f"[dim]命令已发送到服务器 (ID: {cmd_id})[/dim]")
                 else:
@@ -710,6 +771,43 @@ class APIProxyApp(App):
                 log.write(f"  {i}. [cyan]{rule.model_pattern}[/cyan] -> [green]{rule.provider}[/green]:{rule.target_model}")
         except Exception as e:
             log.write(f"[red]❌ 切换方案时发生错误: {e}[/red]")
+
+    async def _handle_reload(self, log: RichLog) -> None:
+        """热重载 providers 和 schemes"""
+        if not self.server_status["ws_connected"]:
+            log.write(f"[yellow]⚠️  WebSocket未连接，无法发送 reload 命令[/yellow]")
+            return
+        log.write(f"[dim]正在热重载配置...[/dim]")
+        cmd_id = await self.server_manager.send_command("reload")
+        if cmd_id:
+            log.write(f"[dim]reload 命令已发送 (ID: {cmd_id})[/dim]")
+        else:
+            log.write(f"[red]❌ 发送 reload 命令失败[/red]")
+
+    async def _handle_list_providers(self, log: RichLog) -> None:
+        """列出所有 provider 的详细信息"""
+        if not self.server_status["ws_connected"]:
+            log.write(f"[yellow]⚠️  WebSocket未连接，无法获取 provider 信息[/yellow]")
+            return
+        log.write(f"[dim]正在获取 provider 列表...[/dim]")
+        cmd_id = await self.server_manager.send_command("list providers")
+        if not cmd_id:
+            log.write(f"[red]❌ 发送 list providers 命令失败[/red]")
+
+    async def _handle_update_models(self, provider_name: str, log: RichLog) -> None:
+        """向 provider 查询可用模型列表并同步到配置"""
+        if not provider_name:
+            log.write(f"[yellow]⚠️  请指定 provider 名称，例如: update models anthropic_official[/yellow]")
+            return
+        if not self.server_status["ws_connected"]:
+            log.write(f"[yellow]⚠️  WebSocket未连接，无法发送 update models 命令[/yellow]")
+            return
+        log.write(f"[dim]正在查询 provider '{provider_name}' 的模型列表...[/dim]")
+        cmd_id = await self.server_manager.send_command("update models", {"provider": provider_name})
+        if cmd_id:
+            log.write(f"[dim]update models 命令已发送 (ID: {cmd_id})[/dim]")
+        else:
+            log.write(f"[red]❌ 发送 update models 命令失败[/red]")
 
     async def _handle_selection_input(self, command: str, log: RichLog) -> None:
         """处理选择模式下的用户输入（方案选择）"""
@@ -847,18 +945,23 @@ class APIProxyApp(App):
         log.write("  [cyan]exit/quit[/cyan]    - 退出程序")
         log.write("")
         log.write("[bold]🚀 服务器控制命令:[/bold]")
-        log.write("  [cyan]start-server[/cyan]   - 启动API服务器")
-        log.write("  [cyan]stop-server[/cyan]    - 停止API服务器")
-        log.write("  [cyan]restart-server[/cyan] - 重启API服务器")
-        log.write("  [cyan]server-status[/cyan]  - 显示服务器状态")
-        log.write("  [cyan]server-info[/cyan]    - 显示服务器详细信息")
+        log.write("  [cyan]start server[/cyan]    - 启动API服务器")
+        log.write("  [cyan]stop server[/cyan]     - 停止API服务器")
+        log.write("  [cyan]restart server[/cyan]  - 重启API服务器")
+        log.write("  [cyan]server status[/cyan]   - 显示服务器状态")
+        log.write("  [cyan]server info[/cyan]     - 显示服务器详细信息")
+        log.write("  [cyan]reload[/cyan]          - 热重载 providers 和 schemes（不重启服务器）")
         log.write("")
         log.write("[bold]🔧 转发方案命令:[/bold]")
-        log.write("  [cyan]list-schemes[/cyan]             - 列出所有可用方案")
-        log.write("  [cyan]current-scheme[/cyan]           - 显示当前方案及规则")
-        log.write("  [cyan]select-scheme[/cyan]            - 交互式选择方案 (菜单)")
-        log.write("  [cyan]select-scheme <name>[/cyan]     - 直接切换到指定方案")
-        log.write("  [cyan]cancel[/cyan]                   - 取消当前选择模式")
+        log.write("  [cyan]list schemes[/cyan]              - 列出所有可用方案")
+        log.write("  [cyan]current scheme[/cyan]            - 显示当前方案及规则")
+        log.write("  [cyan]select scheme[/cyan]             - 交互式选择方案 (菜单)")
+        log.write("  [cyan]select scheme <name>[/cyan]      - 直接切换到指定方案")
+        log.write("  [cyan]cancel[/cyan]                    - 取消当前选择模式")
+        log.write("")
+        log.write("[bold]⚙️  Provider 命令:[/bold]")
+        log.write("  [cyan]list providers[/cyan]            - 列出所有 provider 的详细信息（不含 API Key）")
+        log.write("  [cyan]update models <provider>[/cyan]  - 向 provider 查询可用模型并同步到配置")
         log.write("")
         log.write("[bold]📊 界面说明:[/bold]")
         log.write("  左侧 [操作] Tab:     命令输入和摘要日志")

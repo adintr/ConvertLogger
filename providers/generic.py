@@ -6,7 +6,7 @@
 """
 import json
 import logging
-from typing import Dict, Optional, Tuple, TYPE_CHECKING
+from typing import Dict, List, Optional, Tuple, TYPE_CHECKING
 
 import httpx
 
@@ -26,6 +26,24 @@ def get_default_headers(provider: "ProviderConfig") -> Dict[str, str]:
     if provider.api_version:
         headers["api-version"] = provider.api_version
     return headers
+
+
+async def list_models(provider: "ProviderConfig") -> List[str]:
+    """通用 provider 尝试调用 /v1/models 端点，不支持时抛出异常"""
+    import httpx as _httpx
+    url = f"{provider.base_url.rstrip('/')}/v1/models"
+    auth_headers = provider.get_auth_header()
+    try:
+        async with _httpx.AsyncClient(timeout=30) as client:
+            resp = await client.get(url, headers=auth_headers)
+            resp.raise_for_status()
+            data = resp.json()
+            if "data" in data:
+                return [m["id"] for m in data["data"] if "id" in m]
+            raise NotImplementedError(f"provider '{provider.name}' 返回了不支持的模型列表格式")
+    except Exception as e:
+        logging.error(f"通用 provider 查询模型列表失败 (provider={provider.name}): {e}")
+        raise
 
 
 async def forward_request(
