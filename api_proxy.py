@@ -71,15 +71,12 @@ class APIProxyApp(App):
             "uptime": 0
         }
 
-        # 当前选择的provider和model
-        self.current_provider = None
-        self.current_model = None
+        # 当前选择的转发方案
+        self.current_scheme: Optional[str] = None
 
-        # 选择模式状态
-        self.select_mode = None  # None, 'provider', 'model'
-        self.select_providers = []  # 缓存的provider列表
-        self.select_models = []  # 缓存的model列表
-        self.selected_provider = None  # 临时存储选择的provider
+        # 方案交互选择模式状态
+        self.select_mode = None  # None, 'scheme'
+        self.select_schemes = []  # 缓存的方案列表
 
     async def _handle_server_event(self, event: Dict[str, Any]):
         """处理服务器事件"""
@@ -496,42 +493,24 @@ class APIProxyApp(App):
             return f"{days:.1f}天"
 
     def update_title(self) -> None:
-        """更新标题栏显示代理入口地址和provider"""
+        """更新标题栏显示代理入口地址和当前方案"""
         # 获取服务器地址
         host = self.server_manager.status.host
         port = self.server_manager.status.port
         address = f"{host}:{port}" if host and port else "未启动"
 
-        # 优先使用手动选择的provider和model
-        current_provider = "未选择"
-        current_model = ""
-
-        if self.current_provider:
-            current_provider = self.current_provider
+        # 显示当前方案
+        if self.current_scheme:
+            scheme_display = self.current_scheme
         else:
-            # 从实时统计中获取活跃的provider
-            providers = self.real_time_stats.get("providers", {})
-            if providers:
-                # 找出请求数最多的provider作为当前provider
-                # providers 是 Dict[str, int]，值直接是请求数
-                active_providers = [p for p, cnt in providers.items() if (cnt if isinstance(cnt, int) else cnt.get("requests", 0)) > 0]
-                if active_providers:
-                    # 按请求数排序，providers 值是 int
-                    sorted_providers = sorted(
-                        active_providers,
-                        key=lambda p: providers[p] if isinstance(providers[p], int) else providers[p].get("requests", 0),
-                        reverse=True
-                    )
-                    current_provider = sorted_providers[0]
+            try:
+                config = load_config(self.server_manager.config_path)
+                default = config.get_default_scheme()
+                scheme_display = f"{default.name} (默认)" if default else "无方案"
+            except Exception:
+                scheme_display = "无方案"
 
-        # 添加model信息
-        if self.current_model:
-            current_model = f" ({self.current_model})"
-        elif self.current_provider and not self.current_model:
-            current_model = " (默认模型)"
-
-        # 设置标题和副标题
-        self.title = f"Anthropic API代理终端 v2.0 | {address} -> {current_provider}{current_model}"
+        self.title = f"Anthropic API代理终端 v2.0 | {address} | 方案: {scheme_display}"
         self.sub_title = ""
 
     @on(DataTable.RowSelected, "#history-table")
@@ -593,15 +572,11 @@ class APIProxyApp(App):
                 await asyncio.sleep(0.3)  # 短暂延迟让用户看到消息
 
             self.exit()
-        elif command.lower() == "select":
-            await self._handle_select_command(log)
         elif command.lower() == "cancel":
             # 取消选择模式
             if self.select_mode is not None:
                 self.select_mode = None
-                self.select_providers = []
-                self.select_models = []
-                self.selected_provider = None
+                self.select_schemes = []
                 input_widget = self.query_one("#command-input", Input)
                 input_widget.placeholder = "输入命令 (help查看帮助)..."
                 log.write(f"[dim]选择已取消[/dim]")
@@ -620,202 +595,146 @@ class APIProxyApp(App):
         elif command.lower() == "server-info":
             await self._handle_server_info()
 
-        # provider和model选择命令
-        elif command.lower().startswith("select-provider "):
-            provider_name = command[len("select-provider "):].strip()
-            await self._handle_select_provider(provider_name)
-        elif command.lower() == "list-providers":
-            await self._handle_list_providers()
-        elif command.lower().startswith("select-model "):
-            model_name = command[len("select-model "):].strip()
-            await self._handle_select_model(model_name)
-        elif command.lower() == "list-models":
-            await self._handle_list_models()
-        elif command.lower() == "current-provider":
-            await self._handle_current_provider()
-        elif command.lower() == "current-model":
-            await self._handle_current_model()
-        elif command.lower() == "clear-selection":
-            await self._handle_clear_selection()
+        # 方案选择命令
+        elif command.lower() == "list-schemes":
+            await self._handle_list_schemes(log)
+        elif command.lower() == "current-scheme":
+            await self._handle_current_scheme(log)
+        elif command.lower() == "select-scheme":
+            await self._handle_select_scheme_interactive(log)
+        elif command.lower().startswith("select-scheme "):
+            scheme_name = command[len("select-scheme "):].strip()
+            await self._handle_select_scheme(scheme_name, log)
 
         else:
             log.write(f"[yellow]❓ 未知命令: {command}[/yellow]")
             log.write(f"[dim]输入 'help' 查看可用命令[/dim]")
 
-    async def _handle_select_command(self, log: RichLog) -> None:
-        """处理select命令，显示provider菜单"""
+    async def _handle_list_schemes(self, log: RichLog) -> None:
+        """列出所有可用方案"""
         try:
-            # 加载配置
-            from config import load_config
             config = load_config(self.server_manager.config_path)
-            enabled_providers = config.get_enabled_providers()
-
-            if not enabled_providers:
-                log.write(f"[yellow]⚠️  没有可用的providers[/yellow]")
+            if not config.schemes:
+                log.write(f"[yellow]⚠️  配置文件中没有定义任何方案[/yellow]")
                 return
 
-            # 进入选择模式
-            self.select_mode = 'provider'
-            self.select_providers = enabled_providers
-            self.select_models = []
-            self.selected_provider = None
+            # 确定当前方案名
+            current_name = self.current_scheme or (config.get_default_scheme().name if config.get_default_scheme() else None)
 
-            # 显示菜单
-            log.write(f"\n[bold]🏢 请选择provider (输入数字):[/bold]")
-            for i, provider in enumerate(enabled_providers, 1):
-                status = "✅" if provider.enabled else "❌"
-                proxy_info = " (使用代理)" if provider.proxy_enabled else ""
-                log.write(f"  [bold]{i}. {provider.name}[/bold] {status}{proxy_info}")
-                log.write(f"      类型: {provider.type}, 模型: {len(provider.models)}个")
-                if provider.models:
-                    models_preview = ', '.join(provider.models[:2])
-                    if len(provider.models) > 2:
-                        models_preview += f" ... (共{len(provider.models)}个)"
-                    log.write(f"      示例: {models_preview}")
+            log.write(f"\n[bold]📋 方案列表 (共{len(config.schemes)}个):[/bold]")
+            for scheme in config.schemes:
+                marker = "[bold green]*[/bold green] " if scheme.name == current_name else "  "
+                log.write(f"  {marker}[bold]{scheme.name}[/bold]  {scheme.description}")
 
-            log.write(f"\n[dim]输入 1-{len(enabled_providers)} 选择provider，或输入 'cancel' 取消[/dim]")
-
-            # 更新输入框提示
-            input_widget = self.query_one("#command-input", Input)
-            input_widget.placeholder = f"输入数字 (1-{len(enabled_providers)})..."
-
+            log.write(f"\n[dim]使用 'select-scheme <name>' 或 'select-scheme' 切换方案[/dim]")
         except Exception as e:
-            log.write(f"[red]❌ 显示provider菜单时发生错误: {e}[/red]")
-            self.select_mode = None
-            self.select_providers = []
+            log.write(f"[red]❌ 列出方案时发生错误: {e}[/red]")
 
-    async def _handle_selection_input(self, command: str, log: RichLog) -> None:
-        """处理选择模式下的用户输入"""
-        command_lower = command.lower()
-
-        # 取消命令
-        if command_lower == "cancel":
-            self.select_mode = None
-            self.select_providers = []
-            self.select_models = []
-            self.selected_provider = None
-            input_widget = self.query_one("#command-input", Input)
-            input_widget.placeholder = "输入命令 (help查看帮助)..."
-            log.write(f"[dim]选择已取消[/dim]")
-            return
-
+    async def _handle_current_scheme(self, log: RichLog) -> None:
+        """显示当前方案及规则"""
         try:
-            if self.select_mode == 'provider':
-                # 验证输入是否为数字
-                if not command.isdigit():
-                    log.write(f"[yellow]⚠️  请输入数字 1-{len(self.select_providers)}[/yellow]")
-                    return
+            config = load_config(self.server_manager.config_path)
+            scheme = None
+            if self.current_scheme:
+                scheme = config.get_scheme_by_name(self.current_scheme)
+            if not scheme:
+                scheme = config.get_default_scheme()
 
-                index = int(command)
-                if index < 1 or index > len(self.select_providers):
-                    log.write(f"[yellow]⚠️  请输入有效数字 1-{len(self.select_providers)}[/yellow]")
-                    return
+            if not scheme:
+                log.write(f"[yellow]⚠️  当前没有可用方案[/yellow]")
+                return
 
-                # 选择provider
-                provider = self.select_providers[index - 1]
-                self.selected_provider = provider
-                log.write(f"[green]✅ 已选择provider: {provider.name}[/green]")
-                log.write(f"[dim]类型: {provider.type}, 基础URL: {provider.base_url}[/dim]")
-
-                # 自动选择第一个model
-                if provider.models:
-                    # 进入model选择模式
-                    self.select_mode = 'model'
-                    self.select_models = provider.models
-
-                    # 显示model菜单
-                    log.write(f"\n[bold]🤖 请选择model (输入数字):[/bold]")
-                    for i, model in enumerate(provider.models, 1):
-                        log.write(f"  [bold]{i}. {model}[/bold]")
-
-                    log.write(f"\n[dim]输入 1-{len(provider.models)} 选择model，或输入 'cancel' 取消[/dim]")
-                    log.write(f"[dim]提示: 输入 'auto' 自动选择第一个model[/dim]")
-
-                    # 更新输入框提示
-                    input_widget = self.query_one("#command-input", Input)
-                    input_widget.placeholder = f"输入数字 (1-{len(provider.models)}) 或 'auto'..."
-                else:
-                    log.write(f"[yellow]⚠️  该provider没有可用的models[/yellow]")
-                    # 完成选择，设置默认model为None
-                    await self._finalize_selection(provider.name, None, log)
-
-            elif self.select_mode == 'model':
-                # 处理model选择
-                selected_model = None
-
-                if command_lower == 'auto':
-                    # 自动选择第一个model
-                    if self.select_models:
-                        selected_model = self.select_models[0]
-                        log.write(f"[green]✅ 自动选择model: {selected_model}[/green]")
-                    else:
-                        log.write(f"[yellow]⚠️  没有可用的models[/yellow]")
-                        selected_model = None
-                elif command.isdigit():
-                    index = int(command)
-                    if index < 1 or index > len(self.select_models):
-                        log.write(f"[yellow]⚠️  请输入有效数字 1-{len(self.select_models)}[/yellow]")
-                        return
-                    selected_model = self.select_models[index - 1]
-                    log.write(f"[green]✅ 已选择model: {selected_model}[/green]")
-                else:
-                    log.write(f"[yellow]⚠️  请输入数字或 'auto'[/yellow]")
-                    return
-
-                # 完成选择
-                await self._finalize_selection(self.selected_provider.name, selected_model, log)
-
+            is_default = not self.current_scheme or self.current_scheme == scheme.name
+            suffix = " (默认)" if is_default and not self.current_scheme else ""
+            log.write(f"\n[bold]当前方案: {scheme.name}{suffix}[/bold]")
+            log.write(f"描述: {scheme.description}")
+            log.write(f"规则 ({len(scheme.rules)} 条):")
+            for i, rule in enumerate(scheme.rules, 1):
+                log.write(f"  {i}. [cyan]{rule.model_pattern}[/cyan] -> [green]{rule.provider}[/green]:{rule.target_model}")
         except Exception as e:
-            log.write(f"[red]❌ 处理选择时发生错误: {e}[/red]")
-            self.select_mode = None
-            self.select_providers = []
-            self.select_models = []
-            self.selected_provider = None
+            log.write(f"[red]❌ 获取方案信息时发生错误: {e}[/red]")
 
-    async def _finalize_selection(self, provider_name: str, model_name: Optional[str], log: RichLog) -> None:
-        """完成选择，更新本地状态并发送到服务器"""
+    async def _handle_select_scheme_interactive(self, log: RichLog) -> None:
+        """不带参数的 select-scheme：交互式列表选择"""
         try:
+            config = load_config(self.server_manager.config_path)
+            if not config.schemes:
+                log.write(f"[yellow]⚠️  配置文件中没有定义任何方案[/yellow]")
+                return
+
+            self.select_mode = 'scheme'
+            self.select_schemes = config.schemes
+
+            log.write(f"\n[bold]📋 请选择方案 (输入序号):[/bold]")
+            current_name = self.current_scheme or (config.get_default_scheme().name if config.get_default_scheme() else None)
+            for i, scheme in enumerate(config.schemes, 1):
+                marker = "[green]*[/green] " if scheme.name == current_name else "  "
+                log.write(f"  {marker}[bold][{i}][/bold] {scheme.name}  {scheme.description}")
+
+            log.write(f"\n[dim]输入 1-{len(config.schemes)} 选择，或输入 'cancel' 取消[/dim]")
+            input_widget = self.query_one("#command-input", Input)
+            input_widget.placeholder = f"输入序号 (1-{len(config.schemes)})..."
+        except Exception as e:
+            log.write(f"[red]❌ 显示方案列表时发生错误: {e}[/red]")
+            self.select_mode = None
+            self.select_schemes = []
+
+    async def _handle_select_scheme(self, scheme_name: str, log: RichLog) -> None:
+        """切换到指定方案"""
+        try:
+            config = load_config(self.server_manager.config_path)
+            scheme = config.get_scheme_by_name(scheme_name)
+            if not scheme:
+                available = [s.name for s in config.schemes]
+                log.write(f"[red]❌ 找不到方案: {scheme_name}[/red]")
+                log.write(f"[dim]可用方案: {', '.join(available)}[/dim]")
+                return
+
             # 更新本地状态
-            self.current_provider = provider_name
-            self.current_model = model_name
-
-            # 更新标题
+            self.current_scheme = scheme.name
             self.update_title()
 
-            # 发送到服务器
+            # 同步到服务器
             if self.server_status["ws_connected"]:
-                data = {"provider": provider_name}
-                if model_name:
-                    data["model"] = model_name
-
-                # 通过server_manager发送命令
-                cmd_id = await self.server_manager.send_command("set_default_provider", data)
+                cmd_id = await self.server_manager.send_command("set_scheme", {"scheme": scheme.name})
                 if cmd_id:
                     log.write(f"[dim]命令已发送到服务器 (ID: {cmd_id})[/dim]")
                 else:
                     log.write(f"[yellow]⚠️  发送命令到服务器失败，WebSocket可能未连接[/yellow]")
             else:
-                log.write(f"[yellow]⚠️  WebSocket未连接，无法更新服务器默认设置[/yellow]")
-                log.write(f"[dim]本地选择已更新，但服务器将继续使用之前的默认设置[/dim]")
+                log.write(f"[yellow]⚠️  WebSocket未连接，方案切换仅在本地生效[/yellow]")
 
-            # 显示确认信息
-            model_info = f" ({model_name})" if model_name else ""
-            log.write(f"[green]✅ 选择完成: {provider_name}{model_info}[/green]")
-            log.write(f"[dim]现在将使用此provider和model处理后续请求[/dim]")
+            log.write(f"[green]✅ 已切换到方案: {scheme.name}[/green]")
+            log.write(f"规则 ({len(scheme.rules)} 条):")
+            for i, rule in enumerate(scheme.rules, 1):
+                log.write(f"  {i}. [cyan]{rule.model_pattern}[/cyan] -> [green]{rule.provider}[/green]:{rule.target_model}")
+        except Exception as e:
+            log.write(f"[red]❌ 切换方案时发生错误: {e}[/red]")
 
-            # 重置选择模式
+    async def _handle_selection_input(self, command: str, log: RichLog) -> None:
+        """处理选择模式下的用户输入（方案选择）"""
+        if command.lower() == "cancel":
             self.select_mode = None
-            self.select_providers = []
-            self.select_models = []
-            self.selected_provider = None
-
-            # 恢复输入框提示
+            self.select_schemes = []
             input_widget = self.query_one("#command-input", Input)
             input_widget.placeholder = "输入命令 (help查看帮助)..."
+            log.write(f"[dim]选择已取消[/dim]")
+            return
 
-        except Exception as e:
-            log.write(f"[red]❌ 完成选择时发生错误: {e}[/red]")
+        if self.select_mode == 'scheme':
+            if not command.isdigit():
+                log.write(f"[yellow]⚠️  请输入数字 1-{len(self.select_schemes)}[/yellow]")
+                return
+            index = int(command)
+            if index < 1 or index > len(self.select_schemes):
+                log.write(f"[yellow]⚠️  请输入有效数字 1-{len(self.select_schemes)}[/yellow]")
+                return
+            scheme = self.select_schemes[index - 1]
             self.select_mode = None
+            self.select_schemes = []
+            input_widget = self.query_one("#command-input", Input)
+            input_widget.placeholder = "输入命令 (help查看帮助)..."
+            await self._handle_select_scheme(scheme.name, log)
 
     async def _handle_start_server(self):
         """处理启动服务器命令"""
@@ -915,242 +834,6 @@ class APIProxyApp(App):
         except Exception as e:
             log.write(f"[red]❌ 获取服务器信息失败: {e}[/red]")
 
-    # provider和model选择相关方法
-    async def _handle_select_provider(self, provider_name: str):
-        """选择指定的provider"""
-        log = self.query_one("#api-log", RichLog)
-
-        try:
-            # 加载配置
-            config = load_config(self.server_manager.config_path)
-            enabled_providers = config.get_enabled_providers()
-
-            # 查找provider
-            found_provider = None
-            for provider in enabled_providers:
-                if provider.name.lower() == provider_name.lower():
-                    found_provider = provider
-                    break
-
-            if found_provider:
-                self.current_provider = found_provider.name
-                log.write(f"[green]✅ 已选择provider: {found_provider.name}[/green]")
-                log.write(f"[dim]类型: {found_provider.type}[/dim]")
-                log.write(f"[dim]基础URL: {found_provider.base_url}[/dim]")
-                log.write(f"[dim]支持模型: {', '.join(found_provider.models[:5])}{'...' if len(found_provider.models) > 5 else ''}[/dim]")
-                log.write(f"[dim]权重: {found_provider.weight}, 超时: {found_provider.timeout}秒[/dim]")
-
-                # 更新标题
-                self.update_title()
-            else:
-                log.write(f"[red]❌ 找不到provider: {provider_name}[/red]")
-                log.write(f"[dim]可用的providers: {', '.join([p.name for p in enabled_providers])}[/dim]")
-
-        except Exception as e:
-            log.write(f"[red]❌ 选择provider时发生错误: {e}[/red]")
-
-    async def _handle_list_providers(self):
-        """列出所有可用的providers"""
-        log = self.query_one("#api-log", RichLog)
-
-        try:
-            # 加载配置
-            config = load_config(self.server_manager.config_path)
-            enabled_providers = config.get_enabled_providers()
-
-            if not enabled_providers:
-                log.write(f"[yellow]⚠️  没有可用的providers[/yellow]")
-                return
-
-            log.write(f"\n[bold]🏢 可用providers (共{len(enabled_providers)}个):[/bold]")
-
-            for i, provider in enumerate(enabled_providers, 1):
-                status = "✅" if provider.enabled else "❌"
-                proxy_info = " (使用代理)" if provider.proxy_enabled else ""
-                current_marker = " 👈 当前选择" if self.current_provider == provider.name else ""
-                log.write(f"\n  [bold]{i}. {provider.name}[/bold] {status}{proxy_info}{current_marker}")
-                log.write(f"     类型: {provider.type}")
-                log.write(f"     基础URL: {provider.base_url}")
-                log.write(f"     模型数量: {len(provider.models)}")
-                log.write(f"     权重: {provider.weight}, 超时: {provider.timeout}秒")
-                if provider.models:
-                    models_preview = ', '.join(provider.models[:3])
-                    if len(provider.models) > 3:
-                        models_preview += f" ... (共{len(provider.models)}个)"
-                    log.write(f"     模型示例: {models_preview}")
-
-            log.write(f"\n[dim]使用 'select-provider <name>' 选择provider[/dim]")
-
-        except Exception as e:
-            log.write(f"[red]❌ 列出providers时发生错误: {e}[/red]")
-
-    async def _handle_select_model(self, model_name: str):
-        """选择指定的model"""
-        log = self.query_one("#api-log", RichLog)
-
-        try:
-            # 加载配置
-            config = load_config(self.server_manager.config_path)
-            all_models = config.get_all_supported_models()
-
-            # 查找模型（支持通配符匹配）
-            matched_models = []
-            for model in all_models:
-                if model_name.lower() in model.lower():
-                    matched_models.append(model)
-
-            if not matched_models:
-                log.write(f"[red]❌ 找不到model: {model_name}[/red]")
-                log.write(f"[dim]可用的models: {', '.join(all_models[:10])}{'...' if len(all_models) > 10 else ''}[/dim]")
-                return
-
-            if len(matched_models) == 1:
-                selected_model = matched_models[0]
-                self.current_model = selected_model
-                log.write(f"[green]✅ 已选择model: {selected_model}[/green]")
-
-                # 查找支持该model的providers
-                supporting_providers = config.get_providers_for_model(selected_model)
-                if supporting_providers:
-                    provider_names = [p.name for p in supporting_providers]
-                    log.write(f"[dim]支持该model的providers: {', '.join(provider_names)}[/dim]")
-
-                    # 如果当前没有选择provider，建议选择第一个支持的provider
-                    if not self.current_provider and supporting_providers:
-                        suggested_provider = supporting_providers[0].name
-                        log.write(f"[dim]建议: 使用 'select-provider {suggested_provider}' 选择provider[/dim]")
-                else:
-                    log.write(f"[yellow]⚠️  没有provider支持此model[/yellow]")
-
-                # 更新标题
-                self.update_title()
-            else:
-                log.write(f"[yellow]⚠️  找到多个匹配的models:[/yellow]")
-                for i, model in enumerate(matched_models[:5], 1):
-                    log.write(f"  {i}. {model}")
-                if len(matched_models) > 5:
-                    log.write(f"  ... (共{len(matched_models)}个)")
-                log.write(f"[dim]请指定更精确的model名称[/dim]")
-
-        except Exception as e:
-            log.write(f"[red]❌ 选择model时发生错误: {e}[/red]")
-
-    async def _handle_list_models(self):
-        """列出所有支持的models"""
-        log = self.query_one("#api-log", RichLog)
-
-        try:
-            # 加载配置
-            config = load_config(self.server_manager.config_path)
-            all_models = config.get_all_supported_models()
-
-            if not all_models:
-                log.write(f"[yellow]⚠️  没有可用的models[/yellow]")
-                return
-
-            log.write(f"\n[bold]🤖 可用models (共{len(all_models)}个):[/bold]")
-
-            # 按provider分组显示
-            enabled_providers = config.get_enabled_providers()
-            for provider in enabled_providers:
-                if provider.models:
-                    current_marker = " 👈 当前选择" if self.current_provider == provider.name else ""
-                    log.write(f"\n  [bold]{provider.name}[/bold]{current_marker}:")
-                    for i, model in enumerate(provider.models[:10], 1):
-                        model_current = " ✅" if self.current_model == model else ""
-                        log.write(f"      {i}. {model}{model_current}")
-                    if len(provider.models) > 10:
-                        log.write(f"      ... 还有{len(provider.models) - 10}个模型")
-
-            log.write(f"\n[dim]使用 'select-model <name>' 选择model[/dim]")
-            log.write(f"[dim]当前选择的model: {self.current_model if self.current_model else '未选择'}[/dim]")
-
-        except Exception as e:
-            log.write(f"[red]❌ 列出models时发生错误: {e}[/red]")
-
-    async def _handle_current_provider(self):
-        """显示当前选择的provider"""
-        log = self.query_one("#api-log", RichLog)
-
-        if not self.current_provider:
-            log.write(f"[yellow]⚠️  当前未选择provider[/yellow]")
-            log.write(f"[dim]使用 'list-providers' 查看可用providers[/dim]")
-            log.write(f"[dim]使用 'select-provider <name>' 选择provider[/dim]")
-            return
-
-        try:
-            # 加载配置获取详细信息
-            config = load_config(self.server_manager.config_path)
-            provider_config = config.get_provider_by_name(self.current_provider)
-
-            if not provider_config:
-                log.write(f"[red]❌ 找不到当前选择的provider配置: {self.current_provider}[/red]")
-                self.current_provider = None  # 重置
-                self.update_title()
-                return
-
-            log.write(f"\n[bold]📋 当前选择的provider: {provider_config.name}[/bold]")
-            log.write(f"  类型: {provider_config.type}")
-            log.write(f"  基础URL: {provider_config.base_url}")
-            log.write(f"  模型数量: {len(provider_config.models)}")
-            log.write(f"  权重: {provider_config.weight}")
-            log.write(f"  超时: {provider_config.timeout}秒")
-            log.write(f"  代理: {'启用' if provider_config.proxy_enabled else '禁用'}")
-            if provider_config.models:
-                log.write(f"  模型列表: {', '.join(provider_config.models[:5])}{'...' if len(provider_config.models) > 5 else ''}")
-
-        except Exception as e:
-            log.write(f"[red]❌ 获取provider信息时发生错误: {e}[/red]")
-
-    async def _handle_current_model(self):
-        """显示当前选择的model"""
-        log = self.query_one("#api-log", RichLog)
-
-        if not self.current_model:
-            log.write(f"[yellow]⚠️  当前未选择model[/yellow]")
-            log.write(f"[dim]使用 'list-models' 查看可用models[/dim]")
-            log.write(f"[dim]使用 'select-model <name>' 选择model[/dim]")
-            return
-
-        log.write(f"\n[bold]🤖 当前选择的model: {self.current_model}[/bold]")
-
-        try:
-            # 加载配置查找支持该model的providers
-            config = load_config(self.server_manager.config_path)
-            supporting_providers = config.get_providers_for_model(self.current_model)
-
-            if supporting_providers:
-                log.write(f"[dim]支持该model的providers (共{len(supporting_providers)}个):[/dim]")
-                for provider in supporting_providers:
-                    current_marker = " 👈 当前选择" if self.current_provider == provider.name else ""
-                    log.write(f"  - {provider.name}{current_marker}")
-            else:
-                log.write(f"[yellow]⚠️  没有provider支持此model[/yellow]")
-
-        except Exception as e:
-            log.write(f"[dim]无法获取provider信息: {e}[/dim]")
-
-    async def _handle_clear_selection(self):
-        """清除provider和model选择"""
-        log = self.query_one("#api-log", RichLog)
-
-        if not self.current_provider and not self.current_model:
-            log.write(f"[dim]当前没有选择任何provider或model[/dim]")
-            return
-
-        cleared_items = []
-        if self.current_provider:
-            cleared_items.append(f"provider: {self.current_provider}")
-            self.current_provider = None
-        if self.current_model:
-            cleared_items.append(f"model: {self.current_model}")
-            self.current_model = None
-
-        log.write(f"[green]✅ 已清除选择: {', '.join(cleared_items)}[/green]")
-        log.write(f"[dim]现在将使用自动选择策略[/dim]")
-
-        # 更新标题
-        self.update_title()
 
     def show_help(self) -> None:
         """显示帮助信息"""
@@ -1170,16 +853,12 @@ class APIProxyApp(App):
         log.write("  [cyan]server-status[/cyan]  - 显示服务器状态")
         log.write("  [cyan]server-info[/cyan]    - 显示服务器详细信息")
         log.write("")
-        log.write("[bold]🔧 provider和model选择命令:[/bold]")
-        log.write("  [cyan]select[/cyan]           - 交互式选择provider和model (菜单式)")
-        log.write("  [cyan]cancel[/cyan]           - 取消当前选择模式")
-        log.write("  [cyan]list-providers[/cyan]    - 列出所有可用的providers")
-        log.write("  [cyan]list-models[/cyan]      - 列出所有支持的models")
-        log.write("  [cyan]select-provider <name>[/cyan] - 选择指定的provider")
-        log.write("  [cyan]select-model <name>[/cyan]   - 选择指定的model")
-        log.write("  [cyan]current-provider[/cyan] - 显示当前选择的provider")
-        log.write("  [cyan]current-model[/cyan]    - 显示当前选择的model")
-        log.write("  [cyan]clear-selection[/cyan]  - 清除provider和model选择")
+        log.write("[bold]🔧 转发方案命令:[/bold]")
+        log.write("  [cyan]list-schemes[/cyan]             - 列出所有可用方案")
+        log.write("  [cyan]current-scheme[/cyan]           - 显示当前方案及规则")
+        log.write("  [cyan]select-scheme[/cyan]            - 交互式选择方案 (菜单)")
+        log.write("  [cyan]select-scheme <name>[/cyan]     - 直接切换到指定方案")
+        log.write("  [cyan]cancel[/cyan]                   - 取消当前选择模式")
         log.write("")
         log.write("[bold]📊 界面说明:[/bold]")
         log.write("  左侧 [操作] Tab:     命令输入和摘要日志")

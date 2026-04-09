@@ -208,6 +208,42 @@ class RoutingRule:
     weekdays: List[int] = field(default_factory=list)
 
 
+@dataclass
+class SchemeRule:
+    """转发方案中的单条规则"""
+    model_pattern: str   # 支持 * 通配符
+    provider: str        # provider 名称
+    target_model: str    # 转发给 provider 的目标模型名
+
+
+@dataclass
+class SchemeConfig:
+    """转发方案配置"""
+    name: str
+    description: str
+    rules: List[SchemeRule] = field(default_factory=list)
+
+    def match(self, model_name: str) -> Optional[SchemeRule]:
+        """按顺序匹配规则，返回第一条命中的规则"""
+        for rule in self.rules:
+            pattern = rule.model_pattern.replace("*", ".*")
+            if re.fullmatch(pattern, model_name):
+                return rule
+        return None
+
+
+def _parse_scheme_rule(rule_str: str) -> SchemeRule:
+    """解析单条规则字符串：'model_pattern -> provider_name:target_model'"""
+    left, right = rule_str.split("->", 1)
+    model_pattern = left.strip()
+    provider, target_model = right.strip().split(":", 1)
+    return SchemeRule(
+        model_pattern=model_pattern,
+        provider=provider.strip(),
+        target_model=target_model.strip()
+    )
+
+
 class Config:
     """主配置类"""
 
@@ -221,6 +257,8 @@ class Config:
         self.load_balancing: Optional[LoadBalancingConfig] = None
         self.providers: List[ProviderConfig] = []
         self.routing_rules: List[RoutingRule] = []
+        self.schemes: List[SchemeConfig] = []
+        self.default_scheme: Optional[str] = None
         self._load_config()
 
     def _load_config(self) -> None:
@@ -347,6 +385,23 @@ class Config:
             )
             self.routing_rules.append(rule)
 
+        # 转发方案配置
+        self.default_scheme = self.raw_config.get('default_scheme')
+        schemes_data = self.raw_config.get('schemes', [])
+        for scheme_data in schemes_data:
+            scheme_rules = []
+            for rule_str in scheme_data.get('rules', []):
+                try:
+                    scheme_rules.append(_parse_scheme_rule(rule_str))
+                except Exception as e:
+                    logging.warning(f"方案 '{scheme_data.get('name', '')}' 规则解析失败: {rule_str!r} -> {e}")
+            scheme = SchemeConfig(
+                name=scheme_data.get('name', ''),
+                description=scheme_data.get('description', ''),
+                rules=scheme_rules
+            )
+            self.schemes.append(scheme)
+
     def _set_defaults(self) -> None:
         """设置默认配置"""
         self.server = ServerConfig()
@@ -356,6 +411,8 @@ class Config:
         self.load_balancing = LoadBalancingConfig()
         self.providers = []
         self.routing_rules = []
+        self.schemes = []
+        self.default_scheme = None
 
     def get_enabled_providers(self) -> List[ProviderConfig]:
         """获取启用的提供商列表"""
@@ -465,6 +522,23 @@ class Config:
         for provider in self.get_enabled_providers():
             models.update(provider.models)
         return sorted(list(models))
+
+    def get_scheme_by_name(self, name: str) -> Optional[SchemeConfig]:
+        """根据名称获取方案配置"""
+        for scheme in self.schemes:
+            if scheme.name == name:
+                return scheme
+        return None
+
+    def get_default_scheme(self) -> Optional[SchemeConfig]:
+        """获取默认方案（优先 default_scheme 字段，其次第一个方案）"""
+        if self.default_scheme:
+            scheme = self.get_scheme_by_name(self.default_scheme)
+            if scheme:
+                return scheme
+        if self.schemes:
+            return self.schemes[0]
+        return None
 
     def get_provider_proxy_url(self, provider: ProviderConfig) -> Optional[str]:
         """

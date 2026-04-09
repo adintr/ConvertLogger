@@ -16,7 +16,7 @@ import aiohttp
 from aiohttp import web
 import httpx
 
-from config import load_config, Config, ProviderConfig
+from config import load_config, Config, ProviderConfig, SchemeConfig
 
 
 @dataclass
@@ -251,9 +251,8 @@ class APIServer:
         self.last_heartbeat_time = 0.0
         self.start_time = time.time()  # 服务器启动时间
 
-        # 默认provider和model
-        self.default_provider_name: Optional[str] = None
-        self.default_model_name: Optional[str] = None
+        # 当前转发方案（None 表示使用配置文件中的 default_scheme）
+        self.current_scheme_name: Optional[str] = None
 
         # 设置路由
         self.setup_routes()
@@ -325,15 +324,6 @@ class APIServer:
             else:
                 logging.warning(f"请求指定的provider不存在: {provider_name}")
 
-        # 使用默认provider
-        if self.default_provider_name:
-            provider_client = self.provider_clients.get(self.default_provider_name)
-            if provider_client:
-                logging.debug(f"使用默认provider: {self.default_provider_name}")
-                return provider_client
-            else:
-                logging.warning(f"默认provider不存在或未启用: {self.default_provider_name}")
-
         # 返回第一个可用的provider
         first_provider_name = next(iter(self.provider_clients.keys()), None)
         if first_provider_name:
@@ -341,38 +331,34 @@ class APIServer:
 
         return None
 
-    def select_provider_by_model(self, model_name: str, request: web.Request) -> Optional[ProviderClient]:
+    def get_current_scheme(self) -> Optional[SchemeConfig]:
+        """获取当前生效的转发方案"""
+        name = self.current_scheme_name
+        if name:
+            scheme = self.config.get_scheme_by_name(name)
+            if scheme:
+                return scheme
+        return self.config.get_default_scheme()
+
+    def select_provider_by_scheme(self, model_name: str) -> Tuple[Optional[ProviderClient], str]:
         """
-        根据模型名称选择provider
-
-        首先尝试使用请求指定的provider，然后检查该provider是否支持该模型。
-        如果不支持或未指定provider，则查找支持该模型的provider。
+        用当前方案匹配模型，返回 (provider_client, target_model)。
+        若无方案或无匹配规则，回退到第一个可用 provider，target_model 不变。
         """
-        if not self.provider_clients:
-            return None
+        target_model = model_name
+        scheme = self.get_current_scheme()
+        if scheme:
+            rule = scheme.match(model_name)
+            if rule:
+                client = self.provider_clients.get(rule.provider)
+                if client:
+                    return client, rule.target_model
+                else:
+                    logging.warning(f"方案规则引用的 provider 不存在: {rule.provider}")
 
-        # 首先尝试请求指定的provider
-        provider_client = self.select_provider_by_request(request)
-        if provider_client:
-            # 检查该provider是否支持该模型
-            if provider_client.provider.is_model_supported(model_name):
-                return provider_client
-            else:
-                logging.warning(f"请求指定的provider不支持模型 {model_name}: {provider_client.provider.name}")
-
-        # 优先使用用户设置的默认provider（若支持该模型）
-        if self.default_provider_name:
-            default_client = self.provider_clients.get(self.default_provider_name)
-            if default_client and default_client.provider.is_model_supported(model_name):
-                return default_client
-
-        # 查找支持该模型的provider
-        for client in self.provider_clients.values():
-            if client.provider.is_model_supported(model_name):
-                return client
-
-        # 没有找到支持该模型的provider
-        return None
+        # 无方案 / 无匹配 / provider 不存在 → 使用第一个可用 provider
+        first = next(iter(self.provider_clients.values()), None)
+        return first, target_model
 
     async def start(self) -> None:
         """启动服务器"""
@@ -556,26 +542,31 @@ class APIServer:
                 or (isinstance(stream_value, str) and stream_value.lower() == "true")
             )
 
-            # 如果客户端要求流式，把请求改为非流式再转发给 provider
-            modified_body = body
-            if client_requested_stream:
-                modified_request_data = request_data.copy()
-                modified_request_data["stream"] = False
-                modified_body = json.dumps(modified_request_data).encode()
-                logging.info(f"检测到流式请求，改为非流式转发 provider，响应将重新封装为 SSE (model: {model})")
-
-            # 选择provider
-            provider_client = self.select_provider_by_model(model, request)
+            # 用当前方案匹配 model，得到目标 provider 和目标 model
+            provider_client, target_model = self.select_provider_by_scheme(model)
             if not provider_client:
                 error_response = {
                     "error": {
                         "type": "no_provider",
                         "message": f"No available provider for model: {model}. "
-                                  f"请通过X-Provider请求头或provider查询参数指定provider，"
-                                  f"或确认配置的provider支持该模型。"
+                                  f"请配置 schemes 并确认 provider 存在。"
                     }
                 }
                 return web.json_response(error_response, status=503)
+
+            # 替换 model 字段为方案中的目标模型
+            if target_model != model:
+                request_data = request_data.copy()
+                request_data["model"] = target_model
+                logging.info(f"方案路由: {model} -> {provider_client.provider.name}:{target_model}")
+
+            # 如果客户端要求流式，把请求改为非流式再转发给 provider
+            modified_body = json.dumps(request_data).encode() if target_model != model else body
+            if client_requested_stream:
+                modified_request_data = request_data.copy()
+                modified_request_data["stream"] = False
+                modified_body = json.dumps(modified_request_data).encode()
+                logging.info(f"检测到流式请求，改为非流式转发 provider，响应将重新封装为 SSE (model: {target_model})")
 
             # 构建转发headers，移除客户端认证和连接相关headers
             # 认证header由ProviderClient初始化时配置，不应被客户端header覆盖
@@ -980,51 +971,34 @@ class APIServer:
             config_summary = self.config.get_config_summary()
             await self._send_ws_message(ws, "config_info", config_summary)
 
-        elif action == "set_default_provider":
-            # 设置默认provider和model
-            provider_name = data.get("provider")
-            model_name = data.get("model")
-
-            if provider_name:
-                # 验证provider存在且启用
-                if provider_name in self.provider_clients:
-                    self.default_provider_name = provider_name
-                    logging.info(f"设置默认provider为: {provider_name}")
-
-                    # 如果同时指定了model，验证该provider是否支持该model
-                    if model_name:
-                        provider = self.provider_clients[provider_name].provider
-                        if provider.is_model_supported(model_name):
-                            self.default_model_name = model_name
-                            logging.info(f"设置默认model为: {model_name}")
-                        else:
-                            logging.warning(f"Provider {provider_name} 不支持model {model_name}")
-                            self.default_model_name = None
-                    else:
-                        self.default_model_name = None
-
-                    # 发送确认消息
+        elif action == "set_scheme":
+            # 切换当前转发方案
+            scheme_name = data.get("scheme")
+            if scheme_name:
+                scheme = self.config.get_scheme_by_name(scheme_name)
+                if scheme:
+                    self.current_scheme_name = scheme_name
+                    logging.info(f"切换转发方案为: {scheme_name}")
                     await self._send_ws_message(ws, "command_response", {
-                        "action": "set_default_provider",
+                        "action": "set_scheme",
                         "success": True,
-                        "provider": provider_name,
-                        "model": self.default_model_name,
-                        "message": f"默认provider已设置为 {provider_name}"
+                        "scheme": scheme_name,
+                        "message": f"转发方案已切换为 {scheme_name}"
                     })
                 else:
                     await self._send_ws_message(ws, "error", {
-                        "message": f"Provider不存在或未启用: {provider_name}",
-                        "available_providers": list(self.provider_clients.keys())
+                        "message": f"方案不存在: {scheme_name}",
+                        "available_schemes": [s.name for s in self.config.schemes]
                     })
             else:
                 await self._send_ws_message(ws, "error", {
-                    "message": "缺少provider参数"
+                    "message": "缺少 scheme 参数"
                 })
 
         else:
             await self._send_ws_message(ws, "error", {
                 "message": f"未知命令: {action}",
-                "available_commands": ["shutdown", "get_stats", "get_config", "set_default_provider"]
+                "available_commands": ["shutdown", "get_stats", "get_config", "set_scheme"]
             })
 
     async def _send_ws_message(self, ws: web.WebSocketResponse, msg_type: str, data: dict):
