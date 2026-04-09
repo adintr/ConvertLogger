@@ -17,6 +17,7 @@ from aiohttp import web
 import httpx
 
 from config import load_config, Config, ProviderConfig, SchemeConfig
+from providers.base import load_provider_module
 
 
 @dataclass
@@ -95,38 +96,26 @@ class ProviderClient:
         self.last_used = 0.0
         self.request_count = 0
         self.error_count = 0
+        # 根据 provider.type 动态加载对应的处理模块
+        self._type_module = load_provider_module(provider.type)
 
     async def initialize(self) -> None:
         """初始化HTTP客户端"""
-        # 获取代理配置
         proxy_url = self.config.get_provider_proxy_url(self.provider)
 
-        # 构建headers
-        headers = {
-            "Content-Type": "application/json",
-            "User-Agent": "Anthropic-API-Proxy/1.0",
-            **self.provider.get_auth_header()
-        }
+        # 由各类型模块提供默认请求头
+        headers = self._type_module.get_default_headers(self.provider)
 
-        # 添加provider特定headers
-        if self.provider.headers:
-            headers.update(self.provider.headers)
-
-        # 如果是Azure OpenAI，添加api-version
-        if self.provider.api_version:
-            headers["api-version"] = self.provider.api_version
-
-        # 创建HTTP客户端
         client_kwargs = {
             "headers": headers,
             "timeout": httpx.Timeout(self.provider.timeout),
         }
 
-        # 添加代理配置
         if proxy_url:
             client_kwargs["proxies"] = proxy_url
 
         self.client = httpx.AsyncClient(**client_kwargs)
+        logging.info(f"已初始化 provider '{self.provider.name}' (type={self.provider.type})")
 
     async def close(self) -> None:
         """关闭HTTP客户端"""
@@ -134,12 +123,12 @@ class ProviderClient:
             await self.client.aclose()
 
     async def forward_request(self,
-                             method: str,
-                             path: str,
-                             headers: Dict[str, str],
-                             body: Optional[bytes] = None) -> Tuple[int, Dict[str, str], bytes, Dict[str, str]]:
+                              method: str,
+                              path: str,
+                              headers: Dict[str, str],
+                              body: Optional[bytes] = None) -> Tuple[int, Dict[str, str], bytes, Dict[str, str]]:
         """
-        转发请求到provider
+        转发请求到provider，实际转发逻辑由各类型模块实现。
 
         Returns:
             Tuple[int, Dict[str, str], bytes, Dict[str, str]]: (状态码, 响应头, 响应体, 实际发出的请求头)
@@ -150,58 +139,27 @@ class ProviderClient:
         self.last_used = time.time()
         self.request_count += 1
 
-        try:
-            # 构建完整URL
-            url = f"{self.provider.base_url.rstrip('/')}/{path.lstrip('/')}"
-
-            # 构建实际发出的请求头（合并client默认headers + 传入headers）
-            merged_headers = dict(self.client.headers)
-            merged_headers.update(headers)
-
-            # 转发请求
-            response = await self.client.request(
-                method=method,
-                url=url,
-                headers=headers,
-                content=body
+        status_code, response_headers, response_body, merged_headers = \
+            await self._type_module.forward_request(
+                self.client, self.provider, method, path, headers, body
             )
 
-            # 提取响应信息
-            response_headers = dict(response.headers)
-            response_body = response.content
-
-            # 检查是否成功
-            if response.status_code < 400:
-                self.error_count = 0  # 重置错误计数
-            else:
-                self.error_count += 1
-
-            return response.status_code, response_headers, response_body, merged_headers
-
-        except Exception as e:
+        if status_code < 400:
+            self.error_count = 0
+        else:
             self.error_count += 1
-            logging.error(f"请求转发失败 {self.provider.name}: {e}")
 
-            # 返回错误响应
-            error_response = {
-                "error": {
-                    "type": "proxy_error",
-                    "message": f"Failed to forward request to provider: {str(e)}"
-                }
-            }
-
-            return 502, {"Content-Type": "application/json"}, json.dumps(error_response).encode(), {}
+        return status_code, response_headers, response_body, merged_headers
 
     def is_healthy(self) -> bool:
         """检查provider是否健康"""
-        # 简单健康检查：最近错误次数过多则认为不健康
         return self.error_count < 5
 
     def get_weight(self) -> int:
         """获取当前权重（考虑健康状态）"""
         base_weight = self.provider.weight
         if not self.is_healthy():
-            return max(1, base_weight // 2)  # 不健康时降低权重
+            return max(1, base_weight // 2)
         return base_weight
 
 

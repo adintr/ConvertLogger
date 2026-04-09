@@ -65,6 +65,19 @@ python api_proxy.py
 4. **路由规则** - 基于模型名称、请求参数、时间等的路由策略
 5. **负载均衡** - 轮询、加权、最少连接等策略
 
+### Provider 类型（type 字段）
+
+`type` 字段指定上游 API 的协议类型，决定代理与上游通信时使用哪套请求/响应格式。
+
+| type 值 | 适用上游 | 说明 |
+|---|---|---|
+| `anthropic` | Anthropic 官方 API、Ollama（Anthropic 兼容模式）等 | 默认值。添加 `anthropic-version` 请求头，直接透传 Anthropic 格式的请求和响应。 |
+| `openai` | OpenAI 官方 API、Azure OpenAI、本地 LLM（OpenAI 兼容模式）等 | 支持 `api_version` 字段（Azure 用），直接透传 OpenAI 格式请求。 |
+| `gemini` | Google Gemini API | 使用 `google-genai` SDK 调用。自动将 Anthropic 格式请求转换为 Gemini 格式，并将响应转换回 Anthropic 格式，上层调用无感知。 |
+| 其他未知值 | 任何标准 HTTP API | 回退到通用透传模式（`generic`），直接转发请求和响应，不做任何格式转换。 |
+
+> 如需添加新的上游 API 类型，在 `providers/` 目录下新建对应模块即可，详见 `providers/base.py` 中的接口规范。
+
 ### 快速配置示例
 ```yaml
 # config.yaml 简化示例
@@ -80,6 +93,7 @@ proxy:
 providers:
   - name: "anthropic_official"
     enabled: true
+    type: "anthropic"            # Anthropic 协议（默认值）
     base_url: "https://api.anthropic.com"
     api_key: "${ANTHROPIC_API_KEY}"
     models:
@@ -88,6 +102,15 @@ providers:
     # 提供商特定代理配置（覆盖全局设置）
     proxy_enabled: true
     proxy_url: "http://custom-proxy.example.com:8888"
+
+  - name: "gemini_official"
+    enabled: true
+    type: "gemini"               # Google Gemini，使用 google-genai SDK
+    base_url: "https://generativelanguage.googleapis.com"
+    api_key: "${GEMINI_API_KEY}"
+    models:
+      - "gemini-2.0-flash"
+      - "gemini-2.5-pro"
 ```
 
 ### 环境变量
