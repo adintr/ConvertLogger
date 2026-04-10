@@ -74,6 +74,7 @@ python api_proxy.py
 | `anthropic` | Anthropic 官方 API、Ollama（Anthropic 兼容模式）等 | 默认值。添加 `anthropic-version` 请求头，直接透传 Anthropic 格式的请求和响应。 |
 | `openai` | OpenAI 官方 API、Azure OpenAI、本地 LLM（OpenAI 兼容模式）等 | 支持 `api_version` 字段（Azure 用），直接透传 OpenAI 格式请求。 |
 | `gemini` | Google Gemini API | 使用 `google-genai` SDK 调用。自动将 Anthropic 格式请求转换为 Gemini 格式，并将响应转换回 Anthropic 格式，上层调用无感知。 |
+| `zai` | Z.AI API（GLM 系列模型） | 使用 `zai-sdk`。自动将 Anthropic 格式请求转换为 OpenAI 兼容格式发往 Z.AI，再将响应转换回 Anthropic 格式，支持工具调用和多模态输入。 |
 | 其他未知值 | 任何标准 HTTP API | 回退到通用透传模式（`generic`），直接转发请求和响应，不做任何格式转换。 |
 
 > 如需添加新的上游 API 类型，在 `providers/` 目录下新建对应模块即可，详见 `providers/base.py` 中的接口规范。
@@ -111,6 +112,16 @@ providers:
     models:
       - "gemini-2.0-flash"
       - "gemini-2.5-pro"
+
+  - name: "zai_official"
+    enabled: true
+    type: "zai"                  # Z.AI，Anthropic ↔ OpenAI 格式自动转换
+    base_url: "https://api.z.ai/api/paas/v4"
+    api_key: "${ZAI_API_KEY}"
+    models:
+      - "glm-5.1"
+      - "glm-4.7"
+      - "glm-4.5"
 ```
 
 ### 环境变量
@@ -118,6 +129,7 @@ providers:
 # .env 文件
 ANTHROPIC_API_KEY=sk-ant-xxx
 AZURE_OPENAI_KEY=xxx
+ZAI_API_KEY=your-zai-api-key
 # HTTP代理认证
 PROXY_USER=proxyuser
 PROXY_PASS=proxypassword
