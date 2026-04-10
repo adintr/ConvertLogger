@@ -39,7 +39,6 @@ Anthropic API代理终端样式
 #traffic-log {
     height: 1fr;
     border: solid $panel 50%;
-    padding: 0 1;
     background: $surface-darken-1;
 }
 
@@ -47,7 +46,6 @@ Anthropic API代理终端样式
 #detail-log {
     height: 1fr;
     border: solid $panel 50%;
-    padding: 0 1;
     background: $surface-darken-1;
 }
 
@@ -116,7 +114,6 @@ DataTable > .datatable--header {
 #api-log {
     height: 1fr;
     border: solid $panel 50%;
-    padding: 0 1;
     margin-bottom: 1;
     background: $surface-darken-1;
 }
