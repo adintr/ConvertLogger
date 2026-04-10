@@ -29,19 +29,24 @@ class PendingErrorRequest:
 
     字段说明
     --------
-    error_id        : 唯一标识符，也是 pending_errors 字典的键。
-    provider        : 出错的 provider 名称。
-    model           : 请求的模型名称。
-    status_code     : 上游返回的 HTTP 状态码（网络错误时为 0）。
-    error_type      : "http_error" | "network_error" | "api_error"
-    error_message   : 错误详情文字。
-    response_body   : 上游原始响应体（可能为空）。
-    response_headers: 上游原始响应头（可能为空）。
-    is_stream       : 客户端是否请求了 SSE 流式响应。
-    timestamp       : 错误发生时间（unix timestamp）。
-    decision        : 用户决策结果，初始为 None。
-                      目前仅支持 "return_error"（将错误直接返回客户端）。
-    event           : asyncio.Event，用于通知等待协程用户已做出决策。
+    error_id         : 唯一标识符，也是 pending_errors 字典的键。
+    provider         : 出错的 provider 名称。
+    model            : 请求的模型名称。
+    status_code      : 上游返回的 HTTP 状态码（网络错误时为 0）。
+    error_type       : "http_error" | "network_error" | "api_error"
+    error_message    : 错误详情文字。
+    response_body    : 上游原始响应体（可能为空）。
+    response_headers : 上游原始响应头（可能为空）。
+    is_stream        : 客户端是否请求了 SSE 流式响应。
+    timestamp        : 错误发生时间（unix timestamp）。
+    decision         : 用户决策结果，初始为 None。
+    fake_body        : 用户提供的伪造响应体（fake_response 决策时使用）。
+    retry_headers    : 准备重试时发送给 provider 的 HTTP 头（用户可修改）。
+    retry_body       : 准备重试时发送给 provider 的请求体（用户可修改）。
+    retry_path       : 重试时转发的路径（含查询参数）。
+    retry_method     : 重试时的 HTTP 方法。
+    provider_client  : 用于重试的 ProviderClient 实例（不序列化，仅内存使用）。
+    event            : asyncio.Event，用于通知等待协程用户已做出决策。
     """
     error_id: str
     provider: str
@@ -53,7 +58,14 @@ class PendingErrorRequest:
     response_headers: Dict[str, str]
     is_stream: bool
     timestamp: float
-    decision: Optional[str] = None  # "return_error" | (future: "retry", "fallback", ...)
+    decision: Optional[str] = None  # "return_error" | "fake_response" | "retry"
+    fake_body: Optional[bytes] = None
+    # 重试上下文（由 handle_*_request 在构造时填入，用户可通过 WS 命令修改）
+    retry_headers: Dict[str, str] = field(default_factory=dict)
+    retry_body: bytes = b""
+    retry_path: str = ""
+    retry_method: str = "POST"
+    provider_client: Any = field(default=None, repr=False)
     event: asyncio.Event = field(default_factory=asyncio.Event)
 
 
@@ -819,6 +831,7 @@ class APIServer:
         }))
 
         try:
+            stream_resp: Optional[web.StreamResponse] = None  # 重试路径复用的响应通道
             # 读取请求体
             body = await request.read()
 
@@ -965,6 +978,11 @@ class APIServer:
                         response_headers=dict(response_headers),
                         is_stream=client_requested_stream,
                         timestamp=time.time(),
+                        retry_headers=dict(headers),
+                        retry_body=modified_body,
+                        retry_path=request.path,
+                        retry_method=request.method,
+                        provider_client=provider_client,
                     )
 
             except (httpx.ConnectError, httpx.TimeoutException,
@@ -980,6 +998,11 @@ class APIServer:
                     response_headers={},
                     is_stream=client_requested_stream,
                     timestamp=time.time(),
+                    retry_headers=dict(headers),
+                    retry_body=modified_body,
+                    retry_path=request.path,
+                    retry_method=request.method,
+                    provider_client=provider_client,
                 )
                 # 为后续统计提供默认值
                 status_code = 502
@@ -998,17 +1021,29 @@ class APIServer:
                     "timestamp": time.time(),
                 })
 
-            # ── 上游发生错误：挂起请求，等待用户决策 ──────────────────
+            # ── 上游发生错误：挂起请求，等待用户决策（支持多次重试）──────
             if upstream_error is not None:
-                # 立即记录请求日志，让请求/响应面板在操作面板出现提示的同时就有对应记录
+                # 建立流式响应通道（用于保活），在整个决策循环期间保持连接
+                if client_requested_stream:
+                    stream_resp = web.StreamResponse(status=200, headers={
+                        "content-type": "text/event-stream; charset=utf-8",
+                        "cache-control": "no-cache",
+                        "x-accel-buffering": "no",
+                    })
+                else:
+                    stream_resp = web.StreamResponse(status=200, headers={
+                        "content-type": "application/json",
+                    })
+                await stream_resp.prepare(request)
+
+            while upstream_error is not None:
+                # 记录此次错误的统计（每次错误/重试均记录一条）
                 early_err_body = (
                     upstream_error.response_body
                     if upstream_error.response_body
                     else json.dumps({"error": {"type": upstream_error.error_type,
                                                "message": upstream_error.error_message}}).encode()
                 )
-                # 早期统计：client_response_data 传入 None，面板会显示 provider 原始错误体
-                # 实际发给客户端的内容要等用户决策后才确定
                 self._collect_statistics(
                     provider=provider_client.provider.name,
                     model=model,
@@ -1025,31 +1060,132 @@ class APIServer:
                     client_response_data=b"[pending user decision]",
                 )
 
-                # 建立流式响应通道（用于保活）
+                # 启动保活协程
                 if client_requested_stream:
-                    stream_resp = web.StreamResponse(status=200, headers={
-                        "content-type": "text/event-stream; charset=utf-8",
-                        "cache-control": "no-cache",
-                        "x-accel-buffering": "no",
-                    })
-                    await stream_resp.prepare(request)
                     keepalive = asyncio.create_task(self._keepalive_sse(stream_resp))
                 else:
-                    stream_resp = web.StreamResponse(status=200, headers={
-                        "content-type": "application/json",
-                    })
-                    await stream_resp.prepare(request)
                     keepalive = asyncio.create_task(self._keepalive_chunked(stream_resp))
 
                 # 等待用户决策
                 decision = await self._wait_for_error_decision(upstream_error, keepalive)
 
                 # ── 处理决策 ─────────────────────────────────────────────
-                # 目前仅支持 "return_error"：将错误信息发回客户端
-                # 未来可在此处扩展 "retry"、"fallback" 等分支
+                if decision == "retry":
+                    # 用用户（可能已修改过的）headers/body 重新发送请求
+                    # 若 reload 已重建了 provider 客户端，使用最新实例（旧实例已关闭）
+                    retry_client = self.provider_clients.get(upstream_error.provider, upstream_error.provider_client)
+                    upstream_error.provider_client = retry_client
+                    retry_err: Optional[PendingErrorRequest] = None
+                    retry_fwd_headers: Dict[str, str] = {}
+                    await self._broadcast_ws_message("traffic_chunk", {
+                        "trace_id": trace_id,
+                        "phase": "forwarding",
+                        "provider": upstream_error.provider,
+                        "model": upstream_error.model,
+                        "method": upstream_error.retry_method,
+                        "url": f"{retry_client.provider.base_url.rstrip('/')}/{upstream_error.retry_path.lstrip('/')}",
+                        "timestamp": time.time(),
+                        "note": "retry",
+                    })
+                    try:
+                        status_code, response_headers, response_body, retry_fwd_headers = \
+                            await retry_client.forward_request(
+                                method=upstream_error.retry_method,
+                                path=upstream_error.retry_path,
+                                headers=upstream_error.retry_headers,
+                                body=upstream_error.retry_body,
+                            )
+                        try:
+                            _retry_resp_preview = json.loads(response_body)
+                        except Exception:
+                            _retry_resp_preview = response_body.decode("utf-8", errors="replace")
+                        await self._broadcast_ws_message("traffic_chunk", {
+                            "trace_id": trace_id,
+                            "phase": "provider_response",
+                            "provider": upstream_error.provider,
+                            "status_code": status_code,
+                            "response_time": time.time() - start_time,
+                            "response_headers": dict(response_headers),
+                            "response_body": _retry_resp_preview,
+                            "timestamp": time.time(),
+                            "note": "retry",
+                        })
+                        if status_code >= 400:
+                            try:
+                                err_json2 = json.loads(response_body)
+                                err_msg2 = (
+                                    err_json2.get("error", {}).get("message")
+                                    or err_json2.get("message")
+                                    or response_body.decode("utf-8", errors="replace")
+                                )
+                                error_type2 = "api_error"
+                            except Exception:
+                                err_msg2 = response_body.decode("utf-8", errors="replace")
+                                error_type2 = "http_error"
+                            retry_err = PendingErrorRequest(
+                                error_id=str(uuid.uuid4()),
+                                provider=upstream_error.provider,
+                                model=upstream_error.model,
+                                status_code=status_code,
+                                error_type=error_type2,
+                                error_message=err_msg2,
+                                response_body=response_body,
+                                response_headers=dict(response_headers),
+                                is_stream=client_requested_stream,
+                                timestamp=time.time(),
+                                retry_headers=dict(upstream_error.retry_headers),
+                                retry_body=upstream_error.retry_body,
+                                retry_path=upstream_error.retry_path,
+                                retry_method=upstream_error.retry_method,
+                                provider_client=upstream_error.provider_client,
+                            )
+                    except (httpx.ConnectError, httpx.TimeoutException,
+                            httpx.NetworkError, httpx.RemoteProtocolError) as net_err2:
+                        await self._broadcast_ws_message("traffic_chunk", {
+                            "trace_id": trace_id,
+                            "phase": "provider_response",
+                            "provider": upstream_error.provider,
+                            "status_code": 0,
+                            "response_time": time.time() - start_time,
+                            "response_headers": {},
+                            "response_body": {"error": str(net_err2)},
+                            "timestamp": time.time(),
+                            "note": "retry",
+                        })
+                        retry_err = PendingErrorRequest(
+                            error_id=str(uuid.uuid4()),
+                            provider=upstream_error.provider,
+                            model=upstream_error.model,
+                            status_code=0,
+                            error_type="network_error",
+                            error_message=str(net_err2),
+                            response_body=b"",
+                            response_headers={},
+                            is_stream=client_requested_stream,
+                            timestamp=time.time(),
+                            retry_headers=dict(upstream_error.retry_headers),
+                            retry_body=upstream_error.retry_body,
+                            retry_path=upstream_error.retry_path,
+                            retry_method=upstream_error.retry_method,
+                            provider_client=upstream_error.provider_client,
+                        )
+                        status_code = 502
+                        response_headers = {}
+                        response_body = b""
+                        retry_fwd_headers = {}
+                    forwarded_headers = retry_fwd_headers
+                    upstream_error = retry_err  # None 表示重试成功，退出循环
+                    if upstream_error is None:
+                        # 重试成功，response_body/response_headers/status_code 已更新，跳出循环走正常路径
+                        break
+                    else:
+                        # 重试仍然失败，继续循环等待下一次决策
+                        continue
+
+                # return_error / fake_response 分支：写入响应体后退出
+                _err_client_body_preview = ""
                 if decision == "return_error":
                     if client_requested_stream:
-                        # SSE 格式错误事件
                         err_payload = json.dumps({
                             "type": "error",
                             "error": {
@@ -1064,8 +1200,6 @@ class APIServer:
                         await stream_resp.write(err_sse)
                         _err_client_body_preview = err_sse.decode("utf-8", errors="replace")
                     else:
-                        # JSON 错误体
-                        # 优先使用原始 response_body（已是合法的错误 JSON）
                         if upstream_error.response_body:
                             await stream_resp.write(upstream_error.response_body)
                             _err_client_body_preview = upstream_error.response_body.decode("utf-8", errors="replace")
@@ -1079,23 +1213,26 @@ class APIServer:
                             await stream_resp.write(err_json)
                             _err_client_body_preview = err_json.decode("utf-8", errors="replace")
 
-                    # ── 阶段4（错误路径）：发送给客户端 ──────────────────
-                    await self._broadcast_ws_message("traffic_chunk", {
-                        "trace_id": trace_id,
-                        "phase": "client_response",
-                        "provider": upstream_error.provider,
-                        "model": upstream_error.model,
-                        "status_code": upstream_error.status_code or 502,
-                        "response_time": time.time() - start_time,
-                        "client_response_headers": {},
-                        "client_response_body": _err_client_body_preview,
-                        "timestamp": time.time(),
-                    })
+                elif decision == "fake_response":
+                    fake_data = upstream_error.fake_body or b""
+                    await stream_resp.write(fake_data)
+                    _err_client_body_preview = fake_data.decode("utf-8", errors="replace")
 
+                await self._broadcast_ws_message("traffic_chunk", {
+                    "trace_id": trace_id,
+                    "phase": "client_response",
+                    "provider": upstream_error.provider,
+                    "model": upstream_error.model,
+                    "status_code": upstream_error.status_code or 502,
+                    "response_time": time.time() - start_time,
+                    "client_response_headers": {},
+                    "client_response_body": _err_client_body_preview,
+                    "timestamp": time.time(),
+                })
                 await stream_resp.write_eof()
                 return stream_resp
 
-            # ── 正常路径（上游返回成功响应）────────────────────────────
+            # ── 正常路径（上游返回成功响应 / 重试成功）───────────────────
 
             # 若客户端原本请求流式，将 provider 的非流式 JSON 重新封装为 SSE 格式
             client_body = response_body
@@ -1152,6 +1289,11 @@ class APIServer:
                 "timestamp": time.time(),
             })
 
+            # 若是重试成功（stream_resp 已经 prepare），通过 StreamResponse 写入响应体
+            if stream_resp is not None and stream_resp.prepared:
+                await stream_resp.write(client_body)
+                await stream_resp.write_eof()
+                return stream_resp
             return web.Response(
                 status=status_code,
                 headers=client_headers,
@@ -1214,6 +1356,7 @@ class APIServer:
         }))
 
         try:
+            stream_resp: Optional[web.StreamResponse] = None  # 重试路径复用的响应通道
             # 读取请求体
             body = await request.read()
 
@@ -1349,6 +1492,11 @@ class APIServer:
                         response_headers=dict(response_headers),
                         is_stream=False,
                         timestamp=time.time(),
+                        retry_headers=dict(headers),
+                        retry_body=modified_body,
+                        retry_path=request.path_qs,
+                        retry_method=request.method,
+                        provider_client=provider_client,
                     )
 
             except (httpx.ConnectError, httpx.TimeoutException,
@@ -1364,6 +1512,11 @@ class APIServer:
                     response_headers={},
                     is_stream=False,
                     timestamp=time.time(),
+                    retry_headers=dict(headers),
+                    retry_body=modified_body,
+                    retry_path=request.path_qs,
+                    retry_method=request.method,
+                    provider_client=provider_client,
                 )
                 status_code = 502
                 response_headers = {}
@@ -1380,8 +1533,14 @@ class APIServer:
                     "timestamp": time.time(),
                 })
 
-            # ── 上游发生错误：挂起请求，等待用户决策 ──────────────────
+            # ── 上游发生错误：挂起请求，等待用户决策（支持多次重试）──────
             if upstream_error is not None:
+                stream_resp = web.StreamResponse(status=200, headers={
+                    "content-type": "application/json",
+                })
+                await stream_resp.prepare(request)
+
+            while upstream_error is not None:
                 self._collect_statistics(
                     provider=provider_client.provider.name,
                     model="unknown",
@@ -1400,14 +1559,116 @@ class APIServer:
                     client_response_data=b"[pending user decision]",
                 )
 
-                stream_resp = web.StreamResponse(status=200, headers={
-                    "content-type": "application/json",
-                })
-                await stream_resp.prepare(request)
                 keepalive = asyncio.create_task(self._keepalive_chunked(stream_resp))
-
                 decision = await self._wait_for_error_decision(upstream_error, keepalive)
 
+                if decision == "retry":
+                    # 若 reload 已重建了 provider 客户端，使用最新实例（旧实例已关闭）
+                    retry_client2 = self.provider_clients.get(upstream_error.provider, upstream_error.provider_client)
+                    upstream_error.provider_client = retry_client2
+                    retry_err2: Optional[PendingErrorRequest] = None
+                    retry_fwd2: Dict[str, str] = {}
+                    await self._broadcast_ws_message("traffic_chunk", {
+                        "trace_id": trace_id,
+                        "phase": "forwarding",
+                        "provider": upstream_error.provider,
+                        "model": "unknown",
+                        "method": upstream_error.retry_method,
+                        "url": f"{retry_client2.provider.base_url.rstrip('/')}/{upstream_error.retry_path.lstrip('/')}",
+                        "timestamp": time.time(),
+                        "note": "retry",
+                    })
+                    try:
+                        status_code, response_headers, response_body, retry_fwd2 = \
+                            await retry_client2.forward_request(
+                                method=upstream_error.retry_method,
+                                path=upstream_error.retry_path,
+                                headers=upstream_error.retry_headers,
+                                body=upstream_error.retry_body,
+                            )
+                        try:
+                            _r2_preview = json.loads(response_body)
+                        except Exception:
+                            _r2_preview = response_body.decode("utf-8", errors="replace")
+                        await self._broadcast_ws_message("traffic_chunk", {
+                            "trace_id": trace_id,
+                            "phase": "provider_response",
+                            "provider": upstream_error.provider,
+                            "status_code": status_code,
+                            "response_time": time.time() - start_time,
+                            "response_headers": dict(response_headers),
+                            "response_body": _r2_preview,
+                            "timestamp": time.time(),
+                            "note": "retry",
+                        })
+                        if status_code >= 400:
+                            try:
+                                _ej2 = json.loads(response_body)
+                                _em2 = _ej2.get("error", {}).get("message") or _ej2.get("message") or response_body.decode("utf-8", errors="replace")
+                                _et2 = "api_error"
+                            except Exception:
+                                _em2 = response_body.decode("utf-8", errors="replace")
+                                _et2 = "http_error"
+                            retry_err2 = PendingErrorRequest(
+                                error_id=str(uuid.uuid4()),
+                                provider=upstream_error.provider,
+                                model="unknown",
+                                status_code=status_code,
+                                error_type=_et2,
+                                error_message=_em2,
+                                response_body=response_body,
+                                response_headers=dict(response_headers),
+                                is_stream=False,
+                                timestamp=time.time(),
+                                retry_headers=dict(upstream_error.retry_headers),
+                                retry_body=upstream_error.retry_body,
+                                retry_path=upstream_error.retry_path,
+                                retry_method=upstream_error.retry_method,
+                                provider_client=upstream_error.provider_client,
+                            )
+                    except (httpx.ConnectError, httpx.TimeoutException,
+                            httpx.NetworkError, httpx.RemoteProtocolError) as _ne2:
+                        await self._broadcast_ws_message("traffic_chunk", {
+                            "trace_id": trace_id,
+                            "phase": "provider_response",
+                            "provider": upstream_error.provider,
+                            "status_code": 0,
+                            "response_time": time.time() - start_time,
+                            "response_headers": {},
+                            "response_body": {"error": str(_ne2)},
+                            "timestamp": time.time(),
+                            "note": "retry",
+                        })
+                        retry_err2 = PendingErrorRequest(
+                            error_id=str(uuid.uuid4()),
+                            provider=upstream_error.provider,
+                            model="unknown",
+                            status_code=0,
+                            error_type="network_error",
+                            error_message=str(_ne2),
+                            response_body=b"",
+                            response_headers={},
+                            is_stream=False,
+                            timestamp=time.time(),
+                            retry_headers=dict(upstream_error.retry_headers),
+                            retry_body=upstream_error.retry_body,
+                            retry_path=upstream_error.retry_path,
+                            retry_method=upstream_error.retry_method,
+                            provider_client=upstream_error.provider_client,
+                        )
+                        status_code = 502
+                        response_headers = {}
+                        response_body = b""
+                        retry_fwd2 = {}
+                    forwarded_headers = retry_fwd2
+                    upstream_error = retry_err2
+                    if upstream_error is None:
+                        break  # 重试成功，走正常路径
+                    else:
+                        continue  # 重试失败，继续等待决策
+
+                # return_error / fake_response
+                _err_proxy_preview = ""
                 if decision == "return_error":
                     if upstream_error.response_body:
                         await stream_resp.write(upstream_error.response_body)
@@ -1422,18 +1683,22 @@ class APIServer:
                         await stream_resp.write(err_json_b)
                         _err_proxy_preview = err_json_b.decode("utf-8", errors="replace")
 
-                    await self._broadcast_ws_message("traffic_chunk", {
-                        "trace_id": trace_id,
-                        "phase": "client_response",
-                        "provider": upstream_error.provider,
-                        "model": "unknown",
-                        "status_code": upstream_error.status_code or 502,
-                        "response_time": time.time() - start_time,
-                        "client_response_headers": {},
-                        "client_response_body": _err_proxy_preview,
-                        "timestamp": time.time(),
-                    })
+                elif decision == "fake_response":
+                    fake_data = upstream_error.fake_body or b""
+                    await stream_resp.write(fake_data)
+                    _err_proxy_preview = fake_data.decode("utf-8", errors="replace")
 
+                await self._broadcast_ws_message("traffic_chunk", {
+                    "trace_id": trace_id,
+                    "phase": "client_response",
+                    "provider": upstream_error.provider,
+                    "model": "unknown",
+                    "status_code": upstream_error.status_code or 502,
+                    "response_time": time.time() - start_time,
+                    "client_response_headers": {},
+                    "client_response_body": _err_proxy_preview,
+                    "timestamp": time.time(),
+                })
                 await stream_resp.write_eof()
                 return stream_resp
 
@@ -1478,6 +1743,10 @@ class APIServer:
                 "timestamp": time.time(),
             })
 
+            if stream_resp is not None and stream_resp.prepared:
+                await stream_resp.write(response_body or b"")
+                await stream_resp.write_eof()
+                return stream_resp
             return web.Response(
                 status=status_code,
                 headers=safe_headers,
@@ -1797,9 +2066,104 @@ class APIServer:
                         "provider": provider_name,
                     })
 
+        elif action == "show_pending_request":
+            # 查看某个暂停请求准备发送给 provider 的详细数据
+            # data: {"action": "show_pending_request", "error_id": str}
+            error_id = data.get("error_id")
+            if not error_id or error_id not in self.pending_errors:
+                await self._send_ws_message(ws, "error", {"message": f"错误请求不存在: {error_id}", "action": action})
+            else:
+                pending = self.pending_errors[error_id]
+                _sensitive = {"authorization", "x-api-key", "api-key"}
+                masked_headers = {
+                    k: ("***" if k.lower() in _sensitive else v)
+                    for k, v in pending.retry_headers.items()
+                }
+                try:
+                    body_preview = json.loads(pending.retry_body)
+                except Exception:
+                    body_preview = pending.retry_body.decode("utf-8", errors="replace")
+                await self._send_ws_message(ws, "command_response", {
+                    "action": "show_pending_request",
+                    "error_id": error_id,
+                    "method": pending.retry_method,
+                    "path": pending.retry_path,
+                    "provider": pending.provider,
+                    "base_url": pending.provider_client.provider.base_url if pending.provider_client else "",
+                    "headers": masked_headers,
+                    "body": body_preview,
+                })
+
+        elif action == "set_request_header":
+            # 添加或修改待重试请求的 HTTP 头
+            # data: {"action": "set_request_header", "error_id": str, "key": str, "value": str}
+            error_id = data.get("error_id")
+            key = data.get("key", "").strip()
+            value = data.get("value", "")
+            if not error_id or error_id not in self.pending_errors:
+                await self._send_ws_message(ws, "error", {"message": f"错误请求不存在: {error_id}", "action": action})
+            elif not key:
+                await self._send_ws_message(ws, "error", {"message": "缺少 key 参数", "action": action})
+            else:
+                self.pending_errors[error_id].retry_headers[key] = value
+                await self._send_ws_message(ws, "command_response", {
+                    "action": "set_request_header",
+                    "error_id": error_id,
+                    "key": key,
+                    "value": value if key.lower() not in ("authorization", "x-api-key", "api-key") else "***",
+                    "message": f"已设置请求头 {key}",
+                })
+                logging.info(f"set_request_header: error_id={error_id} key={key}")
+
+        elif action == "delete_request_header":
+            # 删除待重试请求的某个 HTTP 头
+            # data: {"action": "delete_request_header", "error_id": str, "key": str}
+            error_id = data.get("error_id")
+            key = data.get("key", "").strip()
+            if not error_id or error_id not in self.pending_errors:
+                await self._send_ws_message(ws, "error", {"message": f"错误请求不存在: {error_id}", "action": action})
+            elif not key:
+                await self._send_ws_message(ws, "error", {"message": "缺少 key 参数", "action": action})
+            else:
+                removed = self.pending_errors[error_id].retry_headers.pop(key, None)
+                if removed is None:
+                    # 大小写不敏感地查找
+                    for k in list(self.pending_errors[error_id].retry_headers):
+                        if k.lower() == key.lower():
+                            del self.pending_errors[error_id].retry_headers[k]
+                            key = k
+                            removed = True
+                            break
+                await self._send_ws_message(ws, "command_response", {
+                    "action": "delete_request_header",
+                    "error_id": error_id,
+                    "key": key,
+                    "found": removed is not None,
+                    "message": f"已删除请求头 {key}" if removed is not None else f"请求头 {key} 不存在",
+                })
+                logging.info(f"delete_request_header: error_id={error_id} key={key}")
+
+        elif action == "set_request_body":
+            # 替换待重试请求的 body
+            # data: {"action": "set_request_body", "error_id": str, "body": str}
+            error_id = data.get("error_id")
+            new_body = data.get("body", "")
+            if not error_id or error_id not in self.pending_errors:
+                await self._send_ws_message(ws, "error", {"message": f"错误请求不存在: {error_id}", "action": action})
+            else:
+                self.pending_errors[error_id].retry_body = new_body.encode("utf-8") if isinstance(new_body, str) else new_body
+                await self._send_ws_message(ws, "command_response", {
+                    "action": "set_request_body",
+                    "error_id": error_id,
+                    "body_length": len(self.pending_errors[error_id].retry_body),
+                    "message": f"已更新请求体，长度 {len(self.pending_errors[error_id].retry_body)} 字节",
+                })
+                logging.info(f"set_request_body: error_id={error_id} length={len(self.pending_errors[error_id].retry_body)}")
+
         elif action == "resolve_error":
             # 用户对暂停的上游错误请求做出决策
-            # data: {"action": "resolve_error", "error_id": str, "decision": "return_error"}
+            # data: {"action": "resolve_error", "error_id": str, "decision": "return_error"|"fake_response"|"retry",
+            #        "fake_body": str (原始body字符串，可选), "fake_text": str (纯文本，可选)}
             error_id = data.get("error_id")
             user_action = data.get("decision", "return_error")
 
@@ -1816,6 +2180,16 @@ class APIServer:
             else:
                 pending = self.pending_errors[error_id]
                 pending.decision = user_action
+
+                # 解析伪造响应内容
+                if user_action == "fake_response":
+                    if "fake_body" in data:
+                        # 用户提供了原始 HTTP body 字符串，直接编码使用
+                        pending.fake_body = data["fake_body"].encode("utf-8")
+                    elif "fake_text" in data:
+                        # 用户只提供了文本，由服务器组装成合适格式
+                        pending.fake_body = self._build_fake_body(data["fake_text"], pending.is_stream, pending.model)
+
                 pending.event.set()  # 唤醒等待的请求协程
 
                 await self._send_ws_message(ws, "command_response", {
@@ -1830,7 +2204,7 @@ class APIServer:
         else:
             await self._send_ws_message(ws, "error", {
                 "message": f"未知命令: {action}",
-                "available_commands": ["shutdown", "get stats", "get config", "set scheme", "reload", "update models", "list providers", "resolve_error"]
+                "available_commands": ["shutdown", "get stats", "get config", "set scheme", "reload", "update models", "list providers", "resolve_error", "show_pending_request", "set_request_header", "delete_request_header", "set_request_body"]
             })
 
     async def _send_ws_message(self, ws: web.WebSocketResponse, msg_type: str, data: dict):
@@ -1911,7 +2285,8 @@ class APIServer:
             "error_type": pending.error_type,
             "error_message": pending.error_message,
             "timestamp": pending.timestamp,
-            "available_actions": ["return_error"],
+            "is_stream": pending.is_stream,
+            "available_actions": ["return_error", "fake_response"],
         })
         logging.info(
             f"上游错误已暂停，等待用户决策 [id={pending.error_id}] "
@@ -1932,6 +2307,50 @@ class APIServer:
         decision = pending.decision or "return_error"
         logging.info(f"用户决策 [id={pending.error_id}]: {decision}")
         return decision
+
+    @staticmethod
+    def _build_fake_body(text: str, is_stream: bool, model: str) -> bytes:
+        """
+        将用户提供的纯文本组装为符合 Anthropic API 格式的响应体。
+
+        is_stream=True  → SSE 格式（模拟完整流式响应）
+        is_stream=False → JSON 格式（模拟非流式 Message 响应）
+        """
+        if is_stream:
+            # 构造最小化的 SSE 流：message_start → content_block_start → content_block_delta → content_block_stop → message_stop
+            msg_id = f"msg_fake_{uuid.uuid4().hex[:16]}"
+            events = [
+                {"type": "message_start", "message": {
+                    "id": msg_id, "type": "message", "role": "assistant",
+                    "content": [], "model": model, "stop_reason": None,
+                    "stop_sequence": None, "usage": {"input_tokens": 0, "output_tokens": 0},
+                }},
+                {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}},
+                {"type": "ping"},
+                {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": text}},
+                {"type": "content_block_stop", "index": 0},
+                {"type": "message_delta", "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+                 "usage": {"output_tokens": len(text.split())}},
+                {"type": "message_stop"},
+            ]
+            sse_parts = []
+            for ev in events:
+                sse_parts.append(f"event: {ev['type']}\ndata: {json.dumps(ev, ensure_ascii=False)}\n\n")
+            return "".join(sse_parts).encode("utf-8")
+        else:
+            # 构造非流式 Message 响应
+            msg_id = f"msg_fake_{uuid.uuid4().hex[:16]}"
+            body = {
+                "id": msg_id,
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "text", "text": text}],
+                "model": model,
+                "stop_reason": "end_turn",
+                "stop_sequence": None,
+                "usage": {"input_tokens": 0, "output_tokens": len(text.split())},
+            }
+            return json.dumps(body, ensure_ascii=False).encode("utf-8")
 
     @staticmethod
     async def _keepalive_chunked(response: web.StreamResponse, interval: float = 10.0):

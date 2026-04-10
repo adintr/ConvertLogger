@@ -13,6 +13,8 @@ from textual.widgets import (
     DataTable, Input, Label, TabbedContent, TabPane
 )
 from textual.binding import Binding
+from textual.message import Message
+from textual.reactive import reactive
 from datetime import datetime
 import asyncio
 import time
@@ -24,6 +26,43 @@ from server_manager import ServerManager, ServerStatus
 
 # 导入配置管理
 from config import load_config
+
+
+class TrafficBlock(Static):
+    """请求/响应面板中的单条记录块，支持点击三角形折叠/展开内容"""
+
+    DEFAULT_CSS = ""
+    collapsed: reactive[bool] = reactive(False)
+
+    def __init__(self, title: str, **kwargs):
+        # markup=False 避免方括号被 Rich 当成标签解析
+        super().__init__(markup=False, **kwargs)
+        self._title = title
+        self._content_lines: list[str] = []
+
+    def render(self) -> str:
+        triangle = "▶" if self.collapsed else "▼"
+        header = f"{triangle} {self._title}"
+        if self.collapsed:
+            return header
+        body = "\n".join(self._content_lines)
+        return f"{header}\n{body}" if body else header
+
+    def watch_collapsed(self, value: bool) -> None:
+        """折叠状态变化时调整高度"""
+        if value:
+            self.styles.height = 1
+        else:
+            self.styles.height = "auto"
+
+    def on_click(self) -> None:
+        """点击时切换折叠状态"""
+        self.collapsed = not self.collapsed
+
+    def add_line(self, line: str) -> None:
+        """追加一行内容并刷新显示"""
+        self._content_lines.append(line)
+        self.refresh()
 
 
 class APIProxyApp(App):
@@ -77,18 +116,23 @@ class APIProxyApp(App):
         self.current_scheme: Optional[str] = None
 
         # 方案交互选择模式状态
-        self.select_mode = None  # None, 'scheme', 'error'
+        self.select_mode = None  # None, 'scheme', 'error', 'error_fake_input'
         self.select_schemes = []  # 缓存的方案列表
 
         # 上游错误暂停队列：error_id -> 事件摘要（用于用户决策）
         # key: error_id, value: dict with provider/model/status_code/error_message
         self.pending_error_ids: list = []  # 有序列表，方便用数字选择
 
+        # 伪造响应二段输入状态
+        # {"error_id": str, "input_type": "body"|"text", "is_stream": bool, "model": str}
+        self._fake_input_ctx: Optional[dict] = None
+
         # 请求/响应面板：追踪当前"活跃"的 trace_id，用于检测中途插入
         # 当 forwarding/provider_response/client_response 到达时，
         # 若 _traffic_current_trace 不等于本 trace_id，说明期间有其它请求插入，
         # 需要新开一个"继续响应"记录头。
         self._traffic_current_trace: Optional[str] = None
+        self._traffic_current_block: Optional["TrafficBlock"] = None
 
     async def _handle_server_event(self, event: Dict[str, Any]):
         """处理服务器事件"""
@@ -175,8 +219,8 @@ class APIProxyApp(App):
                 )
 
             elif event_type == "traffic_chunk":
-                # 实时显示请求/响应各阶段数据
-                traffic_log = self.query_one("#traffic-log", TextArea)
+                # 实时显示请求/响应各阶段数据（每个 phase 创建一个可折叠 TrafficBlock）
+                traffic_container = self.query_one("#traffic-log", ScrollableContainer)
                 phase = event_data.get("phase", "")
                 trace_id = event_data.get("trace_id", "")
                 provider = event_data.get("provider", "unknown")
@@ -186,63 +230,89 @@ class APIProxyApp(App):
                 if phase == "client_request":
                     method = event_data.get("method", "POST")
                     incoming_url = event_data.get("incoming_url", "")
-                    # 新请求到来时更新当前活跃 trace
                     self._traffic_current_trace = trace_id
-                    self._append(traffic_log, f"\n[bold yellow]{'─' * 60}[/bold yellow]")
-                    self._append(traffic_log, f"[bold yellow]▶ [{timestamp}] 客户端请求 → 代理[/bold yellow]  [dim]model: {model}  provider: {provider}[/dim]")
-                    self._append(traffic_log, f"  [dim]URL:[/dim]  {method} {incoming_url}")
-                    self._append(traffic_log, f"  [dim]Headers:[/dim]")
-                    self._write_headers(traffic_log, event_data.get("incoming_headers", {}))
-                    self._append(traffic_log, f"  [dim]Body:[/dim]")
-                    self._write_body(traffic_log, event_data.get("request_body"))
+                    title = f"[{timestamp}] 客户端请求 → 代理  model:{model}  provider:{provider}"
+                    block = TrafficBlock(title, classes="traffic-block traffic-client-request")
+                    block.add_line(f"  URL:  {method} {incoming_url}")
+                    block.add_line(f"  Headers:")
+                    self._block_write_headers(block, event_data.get("incoming_headers", {}))
+                    block.add_line(f"  Body:")
+                    self._block_write_body(block, event_data.get("request_body"))
+                    self._traffic_current_block = block
+                    await traffic_container.mount(block)
+                    traffic_container.scroll_end(animate=False)
 
                 elif phase == "forwarding":
                     method = event_data.get("method", "POST")
                     url = event_data.get("url", "")
-                    # 若当前活跃 trace 已被其它请求抢占，新开一条记录
+                    note = event_data.get("note", "")
                     if trace_id and self._traffic_current_trace != trace_id:
-                        self._append(traffic_log, f"\n[bold yellow]{'─' * 60}[/bold yellow]")
-                        self._append(traffic_log, f"[bold yellow]↩ [{timestamp}] 继续响应[/bold yellow]  [dim]model: {model}  provider: {provider}[/dim]")
+                        sep = TrafficBlock(f"[{timestamp}] 继续响应  model:{model}  provider:{provider}", classes="traffic-block traffic-resume")
                         self._traffic_current_trace = trace_id
-                    self._append(traffic_log, f"\n[bold cyan]▶ [{timestamp}] 转发请求 → {provider}[/bold cyan]")
-                    self._append(traffic_log, f"  [dim]URL:[/dim]  {method} {url}")
-                    self._append(traffic_log, f"  [dim cyan](等待响应...)[/dim cyan]")
+                        self._traffic_current_block = sep
+                        await traffic_container.mount(sep)
+                    retry_label = "  [重试]" if note == "retry" else ""
+                    title = f"[{timestamp}] 转发请求 → {provider}{retry_label}"
+                    block = TrafficBlock(title, classes="traffic-block traffic-forwarding")
+                    block.add_line(f"  URL:  {method} {url}")
+                    block.add_line(f"  (等待响应...)")
+                    self._traffic_current_block = block
+                    await traffic_container.mount(block)
+                    traffic_container.scroll_end(animate=False)
+                    if note == "retry":
+                        op_log = self.query_one("#api-log", TextArea)
+                        self._append(op_log, f"[cyan]↩  重试请求已发出 → {provider}  {method} {url}[/cyan]")
 
                 elif phase == "provider_response":
                     status_code = event_data.get("status_code", 0)
                     response_time = event_data.get("response_time", 0)
-                    color = "green" if status_code < 400 else "red"
+                    note = event_data.get("note", "")
                     status_str = f"HTTP {status_code}" if status_code else "网络错误"
-                    # 若当前活跃 trace 已被其它请求抢占，新开一条记录
                     if trace_id and self._traffic_current_trace != trace_id:
-                        self._append(traffic_log, f"\n[bold yellow]{'─' * 60}[/bold yellow]")
-                        self._append(traffic_log, f"[bold yellow]↩ [{timestamp}] 继续响应[/bold yellow]  [dim]model: {model}  provider: {provider}[/dim]")
+                        sep = TrafficBlock(f"[{timestamp}] 继续响应  model:{model}  provider:{provider}", classes="traffic-block traffic-resume")
                         self._traffic_current_trace = trace_id
-                    # 补充显示转发请求的 headers（首次有数据时）
+                        self._traffic_current_block = sep
+                        await traffic_container.mount(sep)
+                    retry_label = "  [重试]" if note == "retry" else ""
+                    ok = status_code and status_code < 400
+                    title = f"[{timestamp}] Provider 响应 ← {provider}{retry_label}  {status_str}  {response_time:.2f}s"
+                    css_cls = "traffic-block traffic-provider-ok" if ok else "traffic-block traffic-provider-err"
+                    block = TrafficBlock(title, classes=css_cls)
                     fwd_hdrs = event_data.get("forwarded_headers", {})
                     if fwd_hdrs:
-                        self._append(traffic_log, f"  [dim]转发 Headers:[/dim]")
-                        self._write_headers(traffic_log, fwd_hdrs)
-                    self._append(traffic_log, f"\n[bold {color}]◀ [{timestamp}] Provider 响应 ← {provider}[/bold {color}]  [{color}]{status_str}[/{color}]  [dim]{response_time:.2f}s[/dim]")
-                    self._append(traffic_log, f"  [dim]响应 Headers:[/dim]")
-                    self._write_headers(traffic_log, event_data.get("response_headers", {}))
-                    self._append(traffic_log, f"  [dim]Body:[/dim]")
-                    self._write_body(traffic_log, event_data.get("response_body"))
+                        block.add_line(f"  转发 Headers:")
+                        self._block_write_headers(block, fwd_hdrs)
+                    block.add_line(f"  响应 Headers:")
+                    self._block_write_headers(block, event_data.get("response_headers", {}))
+                    block.add_line(f"  Body:")
+                    self._block_write_body(block, event_data.get("response_body"))
+                    self._traffic_current_block = block
+                    await traffic_container.mount(block)
+                    traffic_container.scroll_end(animate=False)
+                    if note == "retry":
+                        op_log = self.query_one("#api-log", TextArea)
+                        result_str = f"成功 {status_str}" if ok else f"失败 {status_str}"
+                        self._append(op_log, f"[cyan]↩  重试响应[/cyan]  {result_str}  [dim]{response_time:.2f}s[/dim]")
 
                 elif phase == "client_response":
                     status_code = event_data.get("status_code", 0)
                     response_time = event_data.get("response_time", 0)
-                    color = "green" if status_code < 400 else "red"
-                    # 若当前活跃 trace 已被其它请求抢占，新开一条记录
                     if trace_id and self._traffic_current_trace != trace_id:
-                        self._append(traffic_log, f"\n[bold yellow]{'─' * 60}[/bold yellow]")
-                        self._append(traffic_log, f"[bold yellow]↩ [{timestamp}] 继续响应[/bold yellow]  [dim]model: {model}  provider: {provider}[/dim]")
+                        sep = TrafficBlock(f"[{timestamp}] 继续响应  model:{model}  provider:{provider}", classes="traffic-block traffic-resume")
                         self._traffic_current_trace = trace_id
-                    self._append(traffic_log, f"\n[bold magenta]◀ [{timestamp}] 发送给客户端[/bold magenta]  [{color}]HTTP {status_code}[/{color}]  [dim]{response_time:.2f}s[/dim]")
-                    self._append(traffic_log, f"  [dim]Headers:[/dim]")
-                    self._write_headers(traffic_log, event_data.get("client_response_headers", {}))
-                    self._append(traffic_log, f"  [dim]Body:[/dim]")
-                    self._write_sse_body(traffic_log, event_data.get("client_response_body", ""))
+                        self._traffic_current_block = sep
+                        await traffic_container.mount(sep)
+                    ok = status_code and status_code < 400
+                    title = f"[{timestamp}] 发送给客户端  HTTP {status_code}  {response_time:.2f}s"
+                    css_cls = "traffic-block traffic-client-ok" if ok else "traffic-block traffic-client-err"
+                    block = TrafficBlock(title, classes=css_cls)
+                    block.add_line(f"  Headers:")
+                    self._block_write_headers(block, event_data.get("client_response_headers", {}))
+                    block.add_line(f"  Body:")
+                    self._block_write_sse_body(block, event_data.get("client_response_body", ""))
+                    self._traffic_current_block = block
+                    await traffic_container.mount(block)
+                    traffic_container.scroll_end(animate=False)
 
             elif event_type == "providers_info":
                 # 显示 provider 详情列表
@@ -288,6 +358,35 @@ class APIProxyApp(App):
                     if fallback:
                         self._append(log, f"   [yellow]⚠️  当前方案 '{fallback}' 已失效，已回退到默认方案[/yellow]")
 
+                elif action == "show_pending_request":
+                    log = self.query_one("#api-log", TextArea)
+                    import json as _json
+                    body = event_data.get("body", "")
+                    if isinstance(body, dict):
+                        body_str = _json.dumps(body, ensure_ascii=False, indent=2)
+                    else:
+                        body_str = str(body)
+                    headers = event_data.get("headers", {})
+                    self._append(log, f"\n[bold cyan]{'─' * 60}[/bold cyan]")
+                    self._append(log, f"[bold cyan]📤 待发送请求详情 (error_id: {event_data.get('error_id', '')[:8]}...)[/bold cyan]")
+                    self._append(log, f"  [bold]方法:[/bold]    {event_data.get('method', '')}")
+                    self._append(log, f"  [bold]Provider:[/bold] {event_data.get('provider', '')}")
+                    self._append(log, f"  [bold]Base URL:[/bold] {event_data.get('base_url', '')}")
+                    self._append(log, f"  [bold]路径:[/bold]    {event_data.get('path', '')}")
+                    self._append(log, f"  [bold]请求头:[/bold]")
+                    for k, v in headers.items():
+                        self._append(log, f"    {k}: {v}")
+                    self._append(log, f"  [bold]请求体:[/bold]")
+                    for line in body_str.splitlines():
+                        self._append(log, f"    {line}")
+                    self._append(log, f"[bold cyan]{'─' * 60}[/bold cyan]")
+                    self._append(log, f"[dim]可用: set header <编号> <key> <value> | delete header <编号> <key> | set body <编号>[/dim]")
+
+                elif action in ("set_request_header", "delete_request_header", "set_request_body"):
+                    log = self.query_one("#api-log", TextArea)
+                    msg = event_data.get("message", "")
+                    self._append(log, f"[green]✅ {msg}[/green]")
+
             elif event_type == "client_connection":
                 # 客户端连接/断开事件
                 event_action = event_data.get("event")
@@ -326,6 +425,7 @@ class APIProxyApp(App):
                     "status_code": status_code,
                     "error_type": error_type,
                     "error_message": error_message,
+                    "is_stream": event_data.get("is_stream", False),
                 })
                 idx = len(self.pending_error_ids)
 
@@ -344,10 +444,16 @@ class APIProxyApp(App):
                 self._append(log, f"  [bold]状态:[/bold]     {status_str}")
                 self._append(log, f"  [bold]错误信息:[/bold] {error_message[:200]}")
                 self._append(log, f"")
-                self._append(log, f"  [bold yellow]编号 [{idx}]  可用操作:[/bold yellow]")
+                is_stream = event_data.get("is_stream", False)
+                stream_tag = "[dim](流式)[/dim]" if is_stream else "[dim](非流式)[/dim]"
+                self._append(log, f"  [bold yellow]编号 [{idx}]  可用操作: {stream_tag}[/bold yellow]")
                 self._append(log, f"    [cyan]1[/cyan] 将错误直接返回给客户端")
+                self._append(log, f"    [cyan]2[/cyan] 伪造响应 — 提供完整 HTTP 响应 body（字符串）")
+                self._append(log, f"    [cyan]3[/cyan] 伪造响应 — 仅提供文本，程序自动组装为{'SSE流' if is_stream else 'JSON'}格式")
+                self._append(log, f"    [cyan]4[/cyan] 重新发送请求给 provider（可先修改请求后重试）")
                 self._append(log, f"")
-                self._append(log, f"  [dim]输入 'resolve error {idx} 1' 执行对应操作[/dim]")
+                self._append(log, f"  [dim]resolve error {idx} <选项号>    show request {idx}    set header {idx} <key> <val>    set body {idx}[/dim]")
+                self._append(log, f"  [dim]普通命令（reload / select scheme 等）在等待期间仍可正常使用[/dim]")
                 self._append(log, f"[bold red]{'─' * 60}[/bold red]")
 
                 # 进入错误决策选择模式
@@ -436,7 +542,7 @@ class APIProxyApp(App):
 
                     # Tab 2: 请求/响应
                     with TabPane("请求/响应", id="tab-traffic"):
-                        yield TextArea(id="traffic-log", read_only=True, show_line_numbers=False, soft_wrap=True)
+                        yield ScrollableContainer(id="traffic-log")
 
                     # Tab 3: 详情
                     with TabPane("详情", id="tab-detail"):
@@ -477,12 +583,6 @@ class APIProxyApp(App):
         self._append(log, f"[dim]输入 'help' 查看可用命令[/dim]")
         self._append(log, "")
         self._append(log, f"[bold]💡 自动启动API服务器中...[/bold]")
-
-        # 初始化请求/响应 Tab
-        traffic_log = self.query_one("#traffic-log", TextArea)
-        self._append(traffic_log, f"[bold cyan]📡 请求/响应实时监控[/bold cyan]")
-        self._append(traffic_log, f"[dim]等待服务器启动后，所有代理请求和响应将在此实时显示...[/dim]")
-        self._append(traffic_log, f"[dim]包含完整的 HTTP Header 和 Body 内容[/dim]")
 
         # 初始化详情 Tab
         detail_log = self.query_one("#detail-log", TextArea)
@@ -575,6 +675,59 @@ class APIProxyApp(App):
                 for ln in lines:
                     self._append(log, f"{indent}{ln}")
 
+        flush_pings()
+
+    # ── TrafficBlock 写入辅助方法 ────────────────────────────────
+
+    def _block_write_headers(self, block: "TrafficBlock", headers: Dict[str, Any], indent: str = "    ") -> None:
+        if headers:
+            for k, v in headers.items():
+                block.add_line(f"{indent}{k}: {v}")
+        else:
+            block.add_line(f"{indent}(无)")
+
+    def _block_write_body(self, block: "TrafficBlock", body: Any, indent: str = "    ") -> None:
+        if body is None or body == "":
+            block.add_line(f"{indent}(无)")
+            return
+        if isinstance(body, (dict, list)):
+            try:
+                body_str = json_module.dumps(body, ensure_ascii=False, indent=2)
+            except Exception:
+                body_str = str(body)
+        else:
+            body_str = str(body)
+        for line in body_str.splitlines():
+            block.add_line(f"{indent}{line}")
+
+    def _block_write_sse_body(self, block: "TrafficBlock", body: Any, indent: str = "    ") -> None:
+        if body is None or body == "":
+            block.add_line(f"{indent}(无)")
+            return
+        if isinstance(body, (dict, list)):
+            self._block_write_body(block, body, indent)
+            return
+        body_str = str(body)
+        events = [e for e in _re_markup.split(r'\n\n', body_str) if e.strip()]
+        PING_LINE = "event: ping"
+        pending_ping_count = 0
+
+        def flush_pings():
+            nonlocal pending_ping_count
+            if pending_ping_count > 0:
+                label = f"ping ×{pending_ping_count}" if pending_ping_count > 1 else "ping"
+                block.add_line(f"{indent}{label}")
+                pending_ping_count = 0
+
+        for event in events:
+            lines = event.splitlines()
+            is_ping = any(ln.strip() == PING_LINE for ln in lines)
+            if is_ping:
+                pending_ping_count += 1
+            else:
+                flush_pings()
+                for ln in lines:
+                    block.add_line(f"{indent}{ln}")
         flush_pings()
 
     def _write_traffic_log(self, log: TextArea, data: Dict[str, Any], timestamp: str, status_color: str, status_icon: str) -> None:
@@ -813,9 +966,16 @@ class APIProxyApp(App):
         log = self.query_one("#api-log", TextArea)
 
         # 检查是否处于选择模式
-        if self.select_mode is not None:
+        # error 模式允许普通命令穿透（用户可以在等待决策期间修改配置、查看状态等）
+        # error_fake_input 和 scheme 模式必须拦截
+        if self.select_mode in ('scheme', 'error_fake_input'):
             await self._handle_selection_input(command, log)
             return
+        if self.select_mode == 'error':
+            # 错误处理专属命令优先匹配，普通命令则穿透
+            if await self._try_handle_error_mode_command(command, log):
+                return
+            # 未匹配到错误专属命令，继续走普通命令流程
 
         # 处理命令
         if command.lower() == "help":
@@ -1044,6 +1204,128 @@ class APIProxyApp(App):
         else:
             self._append(log, f"[red]❌ 发送 update models 命令失败[/red]")
 
+    async def _try_handle_error_mode_command(self, command: str, log: TextArea) -> bool:
+        """
+        在 error 模式下检查是否为错误处理专属命令。
+        返回 True 表示已处理，False 表示应穿透到普通命令流程。
+        """
+        cmd_lower = command.lower()
+
+        # 既有的 resolve/pending 命令
+        if cmd_lower.startswith("resolve error "):
+            await self._handle_resolve_error(command[len("resolve error "):].strip(), log)
+            return True
+        if cmd_lower == "pending errors":
+            await self._handle_pending_errors(log)
+            return True
+
+        # show request <编号>
+        if cmd_lower.startswith("show request "):
+            await self._handle_show_request(command[len("show request "):].strip(), log)
+            return True
+
+        # set header <编号> <key> <value>
+        if cmd_lower.startswith("set header "):
+            await self._handle_set_header(command[len("set header "):].strip(), log)
+            return True
+
+        # delete header <编号> <key>
+        if cmd_lower.startswith("delete header "):
+            await self._handle_delete_header(command[len("delete header "):].strip(), log)
+            return True
+
+        # set body <编号>（触发二段输入模式）
+        if cmd_lower.startswith("set body "):
+            await self._handle_set_body_prompt(command[len("set body "):].strip(), log)
+            return True
+
+        # 简写：纯数字或"<编号> <选项>"格式当 resolve error 简写
+        parts = command.strip().split()
+        if len(parts) in (1, 2) and all(p.isdigit() for p in parts):
+            await self._handle_resolve_error(command.strip(), log)
+            return True
+
+        return False
+
+    async def _handle_show_request(self, args: str, log: TextArea) -> None:
+        """show request <编号>：查看待重试请求的详细信息"""
+        if not args.isdigit():
+            self._append(log, f"[yellow]⚠️  用法: show request <编号>[/yellow]")
+            return
+        idx = int(args)
+        if idx < 1 or idx > len(self.pending_error_ids):
+            self._append(log, f"[red]❌ 编号 {idx} 不存在[/red]")
+            return
+        err_info = self.pending_error_ids[idx - 1]
+        try:
+            await self.server_manager.ws_client.send_message("command", {
+                "action": "show_pending_request",
+                "error_id": err_info["error_id"],
+            })
+        except Exception as e:
+            self._append(log, f"[red]❌ 发送命令失败: {e}[/red]")
+
+    async def _handle_set_header(self, args: str, log: TextArea) -> None:
+        """set header <编号> <key> <value>：添加/修改请求头"""
+        parts = args.split(None, 2)  # 最多分3段：编号 key value
+        if len(parts) < 3 or not parts[0].isdigit():
+            self._append(log, f"[yellow]⚠️  用法: set header <编号> <key> <value>[/yellow]")
+            return
+        idx = int(parts[0])
+        if idx < 1 or idx > len(self.pending_error_ids):
+            self._append(log, f"[red]❌ 编号 {idx} 不存在[/red]")
+            return
+        err_info = self.pending_error_ids[idx - 1]
+        try:
+            await self.server_manager.ws_client.send_message("command", {
+                "action": "set_request_header",
+                "error_id": err_info["error_id"],
+                "key": parts[1],
+                "value": parts[2],
+            })
+        except Exception as e:
+            self._append(log, f"[red]❌ 发送命令失败: {e}[/red]")
+
+    async def _handle_delete_header(self, args: str, log: TextArea) -> None:
+        """delete header <编号> <key>：删除请求头"""
+        parts = args.split(None, 1)
+        if len(parts) < 2 or not parts[0].isdigit():
+            self._append(log, f"[yellow]⚠️  用法: delete header <编号> <key>[/yellow]")
+            return
+        idx = int(parts[0])
+        if idx < 1 or idx > len(self.pending_error_ids):
+            self._append(log, f"[red]❌ 编号 {idx} 不存在[/red]")
+            return
+        err_info = self.pending_error_ids[idx - 1]
+        try:
+            await self.server_manager.ws_client.send_message("command", {
+                "action": "delete_request_header",
+                "error_id": err_info["error_id"],
+                "key": parts[1],
+            })
+        except Exception as e:
+            self._append(log, f"[red]❌ 发送命令失败: {e}[/red]")
+
+    async def _handle_set_body_prompt(self, args: str, log: TextArea) -> None:
+        """set body <编号>：触发 body 输入模式"""
+        if not args.isdigit():
+            self._append(log, f"[yellow]⚠️  用法: set body <编号>[/yellow]")
+            return
+        idx = int(args)
+        if idx < 1 or idx > len(self.pending_error_ids):
+            self._append(log, f"[red]❌ 编号 {idx} 不存在[/red]")
+            return
+        err_info = self.pending_error_ids[idx - 1]
+        self._fake_input_ctx = {
+            "error_id": err_info["error_id"],
+            "err_list_idx": idx - 1,
+            "input_type": "set_body",
+        }
+        self.select_mode = 'error_fake_input'
+        input_widget = self.query_one("#command-input", Input)
+        self._append(log, f"[yellow]📝 请输入新的请求 body（将替换发给 provider 的请求体）：[/yellow]")
+        input_widget.placeholder = "输入请求 body 后按 Enter 发送..."
+
     async def _handle_selection_input(self, command: str, log: TextArea) -> None:
         """处理选择模式下的用户输入（方案选择 / 错误决策）"""
         if command.lower() == "cancel":
@@ -1077,6 +1359,10 @@ class APIProxyApp(App):
             else:
                 # 允许简写：直接输入 "<编号> <选项号>"
                 await self._handle_resolve_error(command.strip(), log)
+
+        elif self.select_mode == 'error_fake_input':
+            # 等待用户输入伪造响应内容（原始 body 或文本）
+            await self._handle_fake_input(command, log)
 
     async def _handle_start_server(self):
         """处理启动服务器命令"""
@@ -1191,7 +1477,7 @@ class APIProxyApp(App):
                 f"  [{i}] {err['provider']} | {err['model']} | "
                 f"HTTP {err['status_code'] or '网络错误'} | {err['error_message'][:80]}"
             )
-        self._append(log, f"\n[dim]使用 'resolve error <编号> 1' 将错误返回客户端[/dim]")
+        self._append(log, f"\n[dim]resolve error <n> 1/2/3/4  |  show request <n>  |  set header <n> k v  |  set body <n>[/dim]")
 
     async def _handle_resolve_error(self, args: str, log: TextArea) -> None:
         """
@@ -1218,41 +1504,112 @@ class APIProxyApp(App):
             self._append(log, f"[red]❌ 编号 {idx} 不存在，当前有 {len(self.pending_error_ids)} 个待处理错误[/red]")
             return
 
-        # 目前仅支持选项 1: "return_error"
-        action_map = {1: "return_error"}
+        action_map = {1: "return_error", 2: "fake_response_body", 3: "fake_response_text", 4: "retry"}
         if option not in action_map:
-            self._append(log, f"[yellow]⚠️  无效选项 {option}，当前支持: 1=将错误返回客户端[/yellow]")
+            self._append(log, f"[yellow]⚠️  无效选项 {option}，支持: 1=将错误返回客户端 / 2=伪造body / 3=伪造文本 / 4=重新发送请求[/yellow]")
             return
 
         action = action_map[option]
         err_info = self.pending_error_ids[idx - 1]
 
-        # 通过 WebSocket 发送决策给服务器
+        # 选项 2 / 3 需要二段输入：先提示用户输入内容，等用户提交后再发送命令
+        if action in ("fake_response_body", "fake_response_text"):
+            self._fake_input_ctx = {
+                "error_id": err_info["error_id"],
+                "err_list_idx": idx - 1,
+                "input_type": "body" if action == "fake_response_body" else "text",
+                "is_stream": err_info.get("is_stream", False),
+                "model": err_info.get("model", "unknown"),
+            }
+            self.select_mode = 'error_fake_input'
+            input_widget = self.query_one("#command-input", Input)
+            if action == "fake_response_body":
+                self._append(log, f"[yellow]📝 请输入完整的 HTTP 响应 body（将原样发送给客户端）：[/yellow]")
+                input_widget.placeholder = "输入响应 body 后按 Enter 发送..."
+            else:
+                stream_hint = "SSE 流式" if err_info.get("is_stream") else "JSON 非流式"
+                self._append(log, f"[yellow]📝 请输入响应文本（将被自动组装为 {stream_hint} 格式）：[/yellow]")
+                input_widget.placeholder = "输入响应文本后按 Enter 发送..."
+            return
+
+        # 选项 1 / 4 直接发送决策（return_error / retry）
+        action_desc = {
+            "return_error": "将错误返回给客户端",
+            "retry": "重新发送请求给 provider",
+        }
         try:
             await self.server_manager.ws_client.send_message("command", {
                 "action": "resolve_error",
                 "error_id": err_info["error_id"],
                 "decision": action,
             })
-            # 从本地列表移除（服务器处理后不会再推送）
             self.pending_error_ids.pop(idx - 1)
-
-            action_desc = {
-                "return_error": "将错误返回给客户端",
-            }
             self._append(log, f"[green]✅ 已处理错误 [{idx}]：{action_desc[action]}[/green]")
-
-            # 如果没有更多待处理错误，退出错误模式
-            if not self.pending_error_ids:
-                self.select_mode = None
-                input_widget = self.query_one("#command-input", Input)
-                input_widget.placeholder = "输入命令 (help查看帮助)..."
-            else:
-                input_widget = self.query_one("#command-input", Input)
-                input_widget.placeholder = f"还有 {len(self.pending_error_ids)} 个待处理错误，输入 'pending errors' 查看..."
-
+            if action == "retry":
+                self._append(log, f"[dim]  请求已重新发送，若再次失败将继续出现暂停提示[/dim]")
+            self._update_error_mode_placeholder()
         except Exception as e:
             self._append(log, f"[red]❌ 发送决策失败: {e}[/red]")
+
+    def _update_error_mode_placeholder(self) -> None:
+        """根据待处理错误数量更新输入框占位文字和 select_mode"""
+        input_widget = self.query_one("#command-input", Input)
+        if not self.pending_error_ids:
+            self.select_mode = None
+            input_widget.placeholder = "输入命令 (help查看帮助)..."
+        else:
+            # 保持 error 模式
+            self.select_mode = 'error'
+            input_widget.placeholder = f"还有 {len(self.pending_error_ids)} 个待处理错误，输入 'pending errors' 查看..."
+
+    async def _handle_fake_input(self, content: str, log) -> None:
+        """处理用户在 error_fake_input 模式下的输入（伪造响应 / 修改 body）"""
+        ctx = self._fake_input_ctx
+        if ctx is None:
+            return
+
+        self._fake_input_ctx = None
+        self.select_mode = 'error'
+
+        error_id = ctx["error_id"]
+        input_type = ctx["input_type"]
+        err_list_idx = ctx.get("err_list_idx", -1)
+
+        # set_body 模式：修改重试请求体，不移除错误项
+        if input_type == "set_body":
+            try:
+                await self.server_manager.ws_client.send_message("command", {
+                    "action": "set_request_body",
+                    "error_id": error_id,
+                    "body": content,
+                })
+                self._append(log, f"[green]✅ 请求体已更新（{len(content)} 字符），可继续操作或重试[/green]")
+            except Exception as e:
+                self._append(log, f"[red]❌ 更新请求体失败: {e}[/red]")
+            self._update_error_mode_placeholder()
+            return
+
+        # 伪造响应模式
+        ws_payload: dict = {
+            "action": "resolve_error",
+            "error_id": error_id,
+            "decision": "fake_response",
+        }
+        if input_type == "body":
+            ws_payload["fake_body"] = content
+        else:
+            ws_payload["fake_text"] = content
+
+        try:
+            await self.server_manager.ws_client.send_message("command", ws_payload)
+            if 0 <= err_list_idx < len(self.pending_error_ids):
+                self.pending_error_ids.pop(err_list_idx)
+            type_desc = "原始body" if input_type == "body" else "文本"
+            self._append(log, f"[green]✅ 已发送伪造响应（{type_desc}），内容长度: {len(content)} 字符[/green]")
+            self._update_error_mode_placeholder()
+        except Exception as e:
+            self._append(log, f"[red]❌ 发送伪造响应失败: {e}[/red]")
+            self._update_error_mode_placeholder()
 
     def show_help(self) -> None:
         """显示帮助信息"""
@@ -1284,10 +1641,17 @@ class APIProxyApp(App):
         self._append(log, "  [cyan]list providers[/cyan]            - 列出所有 provider 的详细信息（不含 API Key）")
         self._append(log, "  [cyan]update models <provider>[/cyan]  - 向 provider 查询可用模型并同步到配置")
         self._append(log, "")
-        self._append(log, "[bold]🚨 上游错误处理命令:[/bold]")
-        self._append(log, "  [cyan]pending errors[/cyan]              - 列出所有待处理的上游错误")
-        self._append(log, "  [cyan]resolve error <编号> <选项>[/cyan] - 处理指定上游错误")
+        self._append(log, "[bold]🚨 上游错误处理命令（错误等待期间所有普通命令仍可用）:[/bold]")
+        self._append(log, "  [cyan]pending errors[/cyan]                        - 列出所有待处理的上游错误")
+        self._append(log, "  [cyan]resolve error <编号> <选项>[/cyan]           - 处理指定上游错误")
         self._append(log, "    选项: [bold]1[/bold]=将错误直接返回给客户端")
+        self._append(log, "          [bold]2[/bold]=伪造响应（提供完整 HTTP 响应 body 字符串）")
+        self._append(log, "          [bold]3[/bold]=伪造响应（提供文本，程序自动组装为 SSE/JSON 格式）")
+        self._append(log, "          [bold]4[/bold]=重新发送请求给 provider")
+        self._append(log, "  [cyan]show request <编号>[/cyan]                   - 查看准备发给 provider 的请求详情")
+        self._append(log, "  [cyan]set header <编号> <key> <value>[/cyan]       - 添加/修改请求头")
+        self._append(log, "  [cyan]delete header <编号> <key>[/cyan]            - 删除请求头")
+        self._append(log, "  [cyan]set body <编号>[/cyan]                       - 修改请求体（交互式输入）")
         self._append(log, "")
         self._append(log, "[bold]📊 界面说明:[/bold]")
         self._append(log, "  左侧 [操作] Tab:     命令输入和摘要日志")
@@ -1439,13 +1803,17 @@ class APIProxyApp(App):
         tabs = self.query_one("#main-tabs", TabbedContent)
         active = tabs.active
         if active == "tab-traffic":
-            log = self.query_one("#traffic-log", TextArea)
+            container = self.query_one("#traffic-log", ScrollableContainer)
+            container.remove_children()
+            self._traffic_current_block = None
         elif active == "tab-detail":
             log = self.query_one("#detail-log", TextArea)
+            self._clear_log(log)
+            self._append(log, f"[dim]🧹 日志已清空 {datetime.now().strftime('%H:%M:%S')}[/dim]")
         else:
             log = self.query_one("#api-log", TextArea)
-        self._clear_log(log)
-        self._append(log, f"[dim]🧹 日志已清空 {datetime.now().strftime('%H:%M:%S')}[/dim]")
+            self._clear_log(log)
+            self._append(log, f"[dim]🧹 日志已清空 {datetime.now().strftime('%H:%M:%S')}[/dim]")
 
     def action_quit(self) -> None:
         """退出程序"""

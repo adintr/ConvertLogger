@@ -35,11 +35,53 @@ Anthropic API代理终端样式
     layout: vertical;
 }
 
-/* 请求/响应 Tab */
+/* 请求/响应 Tab 容器 */
 #traffic-log {
     height: 1fr;
     border: solid $panel 50%;
     background: $surface-darken-1;
+    overflow-y: auto;
+    padding: 0 1;
+}
+
+/* 每个 traffic 记录块 */
+.traffic-block {
+    width: 100%;
+    height: auto;
+    margin-bottom: 1;
+}
+
+.traffic-block:hover {
+    background: $surface-lighten-1;
+}
+
+/* 各 phase 标题颜色 */
+.traffic-client-request {
+    color: $warning;
+}
+
+.traffic-forwarding {
+    color: $accent;
+}
+
+.traffic-provider-ok {
+    color: $success;
+}
+
+.traffic-provider-err {
+    color: $error;
+}
+
+.traffic-client-ok {
+    color: $secondary;
+}
+
+.traffic-client-err {
+    color: $error;
+}
+
+.traffic-resume {
+    color: $warning-darken-2;
 }
 
 /* 详情 Tab */
