@@ -68,15 +68,20 @@ class APIProxyApp(App):
             "ws_connected": False,
             "last_heartbeat": 0,
             "start_time": 0,
-            "uptime": 0
+            "uptime": 0,
+            "active_clients": 0,
         }
 
         # 当前选择的转发方案
         self.current_scheme: Optional[str] = None
 
         # 方案交互选择模式状态
-        self.select_mode = None  # None, 'scheme'
+        self.select_mode = None  # None, 'scheme', 'error'
         self.select_schemes = []  # 缓存的方案列表
+
+        # 上游错误暂停队列：error_id -> 事件摘要（用于用户决策）
+        # key: error_id, value: dict with provider/model/status_code/error_message
+        self.pending_error_ids: list = []  # 有序列表，方便用数字选择
 
     async def _handle_server_event(self, event: Dict[str, Any]):
         """处理服务器事件"""
@@ -142,10 +147,6 @@ class APIProxyApp(App):
                 log.write(f"[{status_color}]{status_icon} [{timestamp}] {provider}: {model} (HTTP {status_code}) - {response_time:.2f}s - {tokens} tokens[/{status_color}]")
                 log.scroll_end(animate=False)
 
-                # 在"请求/响应" Tab 写入详细流量信息
-                traffic_log = self.query_one("#traffic-log", RichLog)
-                self._write_traffic_log(traffic_log, event_data, timestamp, status_color, status_icon)
-
                 # 添加到历史记录（保留完整 event_data 供详情使用）
                 history_item = {
                     "time": timestamp,
@@ -166,6 +167,70 @@ class APIProxyApp(App):
                     str(tokens),
                     status_display
                 )
+
+            elif event_type == "traffic_chunk":
+                # 实时显示请求/响应各阶段数据
+                traffic_log = self.query_one("#traffic-log", RichLog)
+                phase = event_data.get("phase", "")
+                provider = event_data.get("provider", "unknown")
+                model = event_data.get("model", "")
+                timestamp = datetime.fromtimestamp(event_data.get("timestamp", time.time())).strftime("%H:%M:%S")
+
+                if phase == "client_request":
+                    method = event_data.get("method", "POST")
+                    incoming_url = event_data.get("incoming_url", "")
+                    traffic_log.write(f"\n[bold yellow]{'─' * 60}[/bold yellow]")
+                    traffic_log.write(f"[bold yellow]▶ [{timestamp}] 客户端请求 → 代理[/bold yellow]  [dim]model: {model}  provider: {provider}[/dim]")
+                    traffic_log.write(f"  [dim]URL:[/dim]  {method} {incoming_url}")
+                    traffic_log.write(f"  [dim]Headers:[/dim]")
+                    self._write_headers(traffic_log, event_data.get("incoming_headers", {}))
+                    traffic_log.write(f"  [dim]Body:[/dim]")
+                    self._write_body(traffic_log, event_data.get("request_body"))
+                    traffic_log.scroll_end(animate=False)
+
+                elif phase == "forwarding":
+                    method = event_data.get("method", "POST")
+                    url = event_data.get("url", "")
+                    traffic_log.write(f"\n[bold cyan]▶ 转发请求 → {provider}[/bold cyan]")
+                    traffic_log.write(f"  [dim]URL:[/dim]  {method} {url}")
+                    traffic_log.write(f"  [dim cyan](等待响应...)[/dim cyan]")
+                    traffic_log.scroll_end(animate=False)
+
+                elif phase == "provider_response":
+                    status_code = event_data.get("status_code", 0)
+                    response_time = event_data.get("response_time", 0)
+                    color = "green" if status_code < 400 else "red"
+                    status_str = f"HTTP {status_code}" if status_code else "网络错误"
+                    # 补充显示转发请求的 headers（首次有数据时）
+                    fwd_hdrs = event_data.get("forwarded_headers", {})
+                    if fwd_hdrs:
+                        traffic_log.write(f"  [dim]转发 Headers:[/dim]")
+                        self._write_headers(traffic_log, fwd_hdrs)
+                    traffic_log.write(f"\n[bold {color}]◀ Provider 响应 ← {provider}[/bold {color}]  [{color}]{status_str}[/{color}]  [dim]{response_time:.2f}s[/dim]")
+                    traffic_log.write(f"  [dim]响应 Headers:[/dim]")
+                    self._write_headers(traffic_log, event_data.get("response_headers", {}))
+                    traffic_log.write(f"  [dim]Body:[/dim]")
+                    self._write_body(traffic_log, event_data.get("response_body"))
+                    traffic_log.scroll_end(animate=False)
+
+                elif phase == "client_response":
+                    status_code = event_data.get("status_code", 0)
+                    response_time = event_data.get("response_time", 0)
+                    color = "green" if status_code < 400 else "red"
+                    traffic_log.write(f"\n[bold magenta]◀ 发送给客户端[/bold magenta]  [{color}]HTTP {status_code}[/{color}]  [dim]{response_time:.2f}s[/dim]")
+                    traffic_log.write(f"  [dim]Headers:[/dim]")
+                    self._write_headers(traffic_log, event_data.get("client_response_headers", {}))
+                    traffic_log.write(f"  [dim]Body:[/dim]")
+                    client_body_str = event_data.get("client_response_body", "")
+                    # SSE 内容很长，只显示前500字符
+                    if isinstance(client_body_str, str) and len(client_body_str) > 500:
+                        traffic_log.write(f"    [dim](SSE流，共{len(client_body_str)}字节，显示前500字符)[/dim]")
+                        for ln in client_body_str[:500].splitlines():
+                            traffic_log.write(f"    {ln}")
+                        traffic_log.write(f"    [dim]...[/dim]")
+                    else:
+                        self._write_body(traffic_log, client_body_str)
+                    traffic_log.scroll_end(animate=False)
 
             elif event_type == "providers_info":
                 # 显示 provider 详情列表
@@ -211,9 +276,73 @@ class APIProxyApp(App):
                     if fallback:
                         log.write(f"   [yellow]⚠️  当前方案 '{fallback}' 已失效，已回退到默认方案[/yellow]")
 
+            elif event_type == "client_connection":
+                # 客户端连接/断开事件
+                event_action = event_data.get("event")
+                client_ip = event_data.get("client_ip", "unknown")
+                path = event_data.get("path", "")
+                active_clients = event_data.get("active_clients", 0)
+                self.server_status["active_clients"] = active_clients
+
+                log = self.query_one("#api-log", RichLog)
+                if event_action == "connected":
+                    log.write(f"[cyan]🔌 客户端连接: {client_ip} → {path}  (活跃连接: {active_clients})[/cyan]")
+                else:
+                    log.write(f"[dim]🔌 客户端断开: {client_ip} ← {path}  (活跃连接: {active_clients})[/dim]")
+
+                self.update_token_display()
+
             elif event_type == "config_reloaded":
                 # 广播消息（其他 WebSocket 客户端收到），本客户端已由 command_response 处理，忽略
                 pass
+
+            elif event_type == "upstream_error":
+                # 上游API错误，需要用户决策
+                log = self.query_one("#api-log", RichLog)
+                error_id = event_data.get("error_id", "")
+                provider = event_data.get("provider", "unknown")
+                model = event_data.get("model", "unknown")
+                status_code = event_data.get("status_code", 0)
+                error_type = event_data.get("error_type", "unknown")
+                error_message = event_data.get("error_message", "")
+
+                # 记录到待处理列表
+                self.pending_error_ids.append({
+                    "error_id": error_id,
+                    "provider": provider,
+                    "model": model,
+                    "status_code": status_code,
+                    "error_type": error_type,
+                    "error_message": error_message,
+                })
+                idx = len(self.pending_error_ids)
+
+                # 切换到操作 Tab 并醒目展示
+                tabs = self.query_one("#main-tabs", TabbedContent)
+                tabs.active = "tab-operation"
+
+                log.write(f"")
+                log.write(f"[bold red]{'─' * 60}[/bold red]")
+                log.write(f"[bold red]⚠️  上游API错误 — 请求已暂停，等待您的处理[/bold red]")
+                log.write(f"[bold red]{'─' * 60}[/bold red]")
+                log.write(f"  [bold]Provider:[/bold] {provider}")
+                log.write(f"  [bold]模型:[/bold]     {model}")
+                log.write(f"  [bold]错误类型:[/bold] {error_type}")
+                status_str = f"HTTP {status_code}" if status_code else "网络错误"
+                log.write(f"  [bold]状态:[/bold]     {status_str}")
+                log.write(f"  [bold]错误信息:[/bold] {error_message[:200]}")
+                log.write(f"")
+                log.write(f"  [bold yellow]编号 [{idx}]  可用操作:[/bold yellow]")
+                log.write(f"    [cyan]1[/cyan] 将错误直接返回给客户端")
+                log.write(f"")
+                log.write(f"  [dim]输入 'resolve error {idx} 1' 执行对应操作[/dim]")
+                log.write(f"[bold red]{'─' * 60}[/bold red]")
+                log.scroll_end(animate=False)
+
+                # 进入错误决策选择模式
+                self.select_mode = 'error'
+                input_widget = self.query_one("#command-input", Input)
+                input_widget.placeholder = f"输入 'resolve error {idx} 1' 处理错误，或 'resolve error {idx} <选项号>'..."
 
             elif event_type == "error":
                 # 显示错误信息
@@ -512,10 +641,14 @@ class APIProxyApp(App):
         else:
             uptime_str = "N/A"
 
+        active_clients = server_status.get("active_clients", 0)
+        clients_color = "green" if active_clients > 0 else "dim"
+
         content = (
             f"[bold]{server_icon} 服务器状态: {server_text}[/bold]\n"
             f"[bold]{ws_icon} WebSocket: {ws_text}[/bold]\n"
             f"[bold]⏱️  运行时间: {uptime_str}[/bold]\n"
+            f"[bold {clients_color}]🔌 活跃连接: {active_clients}[/bold {clients_color}]\n"
             f"────────────────\n"
             f"[bold]📊 统计信息:[/bold]\n"
             f"[bold]总请求:[/bold] {stats['total_calls']}\n"
@@ -667,6 +800,15 @@ class APIProxyApp(App):
         elif command.lower() == "update models":
             log.write(f"[yellow]⚠️  请指定 provider 名称，例如: update models anthropic_official[/yellow]")
 
+        # 上游错误决策命令
+        # 格式: resolve error <编号> <选项号>
+        #  编号: pending_error_ids 列表中的位置（1-based）
+        #  选项号: 1=将错误返回客户端
+        elif command.lower().startswith("resolve error "):
+            await self._handle_resolve_error(command[len("resolve error "):].strip(), log)
+        elif command.lower() == "pending errors":
+            await self._handle_pending_errors(log)
+
         else:
             log.write(f"[yellow]❓ 未知命令: {command}[/yellow]")
             log.write(f"[dim]输入 'help' 查看可用命令[/dim]")
@@ -810,7 +952,7 @@ class APIProxyApp(App):
             log.write(f"[red]❌ 发送 update models 命令失败[/red]")
 
     async def _handle_selection_input(self, command: str, log: RichLog) -> None:
-        """处理选择模式下的用户输入（方案选择）"""
+        """处理选择模式下的用户输入（方案选择 / 错误决策）"""
         if command.lower() == "cancel":
             self.select_mode = None
             self.select_schemes = []
@@ -833,6 +975,15 @@ class APIProxyApp(App):
             input_widget = self.query_one("#command-input", Input)
             input_widget.placeholder = "输入命令 (help查看帮助)..."
             await self._handle_select_scheme(scheme.name, log)
+
+        elif self.select_mode == 'error':
+            # 错误决策模式：支持完整的 resolve error 命令或简写（"<编号> <选项>"）
+            cmd_lower = command.lower()
+            if cmd_lower.startswith("resolve error "):
+                await self._handle_resolve_error(command[len("resolve error "):].strip(), log)
+            else:
+                # 允许简写：直接输入 "<编号> <选项号>"
+                await self._handle_resolve_error(command.strip(), log)
 
     async def _handle_start_server(self):
         """处理启动服务器命令"""
@@ -933,6 +1084,82 @@ class APIProxyApp(App):
             log.write(f"[red]❌ 获取服务器信息失败: {e}[/red]")
 
 
+    async def _handle_pending_errors(self, log: RichLog) -> None:
+        """列出所有待处理的上游错误"""
+        pending = self.pending_error_ids
+        if not pending:
+            log.write(f"[dim]当前没有待处理的上游错误[/dim]")
+            return
+
+        log.write(f"\n[bold]⚠️  待处理上游错误 (共 {len(pending)} 个):[/bold]")
+        for i, err in enumerate(pending, 1):
+            log.write(
+                f"  [{i}] {err['provider']} | {err['model']} | "
+                f"HTTP {err['status_code'] or '网络错误'} | {err['error_message'][:80]}"
+            )
+        log.write(f"\n[dim]使用 'resolve error <编号> 1' 将错误返回客户端[/dim]")
+
+    async def _handle_resolve_error(self, args: str, log: RichLog) -> None:
+        """
+        处理 'resolve error <编号> <选项号>' 命令。
+
+        选项号对应的操作（当前仅支持第 1 号）：
+          1 — 将上游错误直接返回给客户端
+        """
+        parts = args.split()
+        if len(parts) < 2:
+            log.write(f"[yellow]⚠️  用法: resolve error <编号> <选项号>[/yellow]")
+            log.write(f"  例如: resolve error 1 1  （将第 1 个错误返回给客户端）")
+            log.write(f"  输入 'pending errors' 查看当前待处理错误列表")
+            return
+
+        try:
+            idx = int(parts[0])
+            option = int(parts[1])
+        except ValueError:
+            log.write(f"[red]❌ 编号和选项号必须为整数[/red]")
+            return
+
+        if idx < 1 or idx > len(self.pending_error_ids):
+            log.write(f"[red]❌ 编号 {idx} 不存在，当前有 {len(self.pending_error_ids)} 个待处理错误[/red]")
+            return
+
+        # 目前仅支持选项 1: "return_error"
+        action_map = {1: "return_error"}
+        if option not in action_map:
+            log.write(f"[yellow]⚠️  无效选项 {option}，当前支持: 1=将错误返回客户端[/yellow]")
+            return
+
+        action = action_map[option]
+        err_info = self.pending_error_ids[idx - 1]
+
+        # 通过 WebSocket 发送决策给服务器
+        try:
+            await self.server_manager.ws_client.send_message("command", {
+                "action": "resolve_error",
+                "error_id": err_info["error_id"],
+                "decision": action,
+            })
+            # 从本地列表移除（服务器处理后不会再推送）
+            self.pending_error_ids.pop(idx - 1)
+
+            action_desc = {
+                "return_error": "将错误返回给客户端",
+            }
+            log.write(f"[green]✅ 已处理错误 [{idx}]：{action_desc[action]}[/green]")
+
+            # 如果没有更多待处理错误，退出错误模式
+            if not self.pending_error_ids:
+                self.select_mode = None
+                input_widget = self.query_one("#command-input", Input)
+                input_widget.placeholder = "输入命令 (help查看帮助)..."
+            else:
+                input_widget = self.query_one("#command-input", Input)
+                input_widget.placeholder = f"还有 {len(self.pending_error_ids)} 个待处理错误，输入 'pending errors' 查看..."
+
+        except Exception as e:
+            log.write(f"[red]❌ 发送决策失败: {e}[/red]")
+
     def show_help(self) -> None:
         """显示帮助信息"""
         log = self.query_one("#api-log", RichLog)
@@ -962,6 +1189,11 @@ class APIProxyApp(App):
         log.write("[bold]⚙️  Provider 命令:[/bold]")
         log.write("  [cyan]list providers[/cyan]            - 列出所有 provider 的详细信息（不含 API Key）")
         log.write("  [cyan]update models <provider>[/cyan]  - 向 provider 查询可用模型并同步到配置")
+        log.write("")
+        log.write("[bold]🚨 上游错误处理命令:[/bold]")
+        log.write("  [cyan]pending errors[/cyan]              - 列出所有待处理的上游错误")
+        log.write("  [cyan]resolve error <编号> <选项>[/cyan] - 处理指定上游错误")
+        log.write("    选项: [bold]1[/bold]=将错误直接返回给客户端")
         log.write("")
         log.write("[bold]📊 界面说明:[/bold]")
         log.write("  左侧 [操作] Tab:     命令输入和摘要日志")

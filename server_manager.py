@@ -384,6 +384,18 @@ class ServerManager:
             # 广播：配置已重载
             await self._emit_event("config_reloaded", msg_data)
 
+        elif msg_type == "upstream_error":
+            # 上游API错误暂停事件，需要转发给UI让用户决策
+            await self._emit_event("upstream_error", msg_data)
+
+        elif msg_type == "traffic_chunk":
+            # 实时流量分阶段数据
+            await self._emit_event("traffic_chunk", msg_data)
+
+        elif msg_type == "client_connection":
+            # 客户端连接/断开事件
+            await self._emit_event("client_connection", msg_data)
+
         elif msg_type == "error":
             # 错误消息
             await self._emit_event("error", msg_data)

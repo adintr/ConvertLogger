@@ -181,6 +181,67 @@ python api_server.py
 python api_server.py --config custom_config.yaml
 ```
 
+### 上游错误处理架构
+
+当 provider 上游 API 返回错误（网络错误、HTTP 错误、API 级错误）时，系统不立即返回错误，而是暂停请求等待用户决策。
+
+#### 数据流
+
+```
+上游错误发生
+  └─ api_server.py: handle_anthropic_request()
+       ├─ 捕获 httpx 网络错误 → 构造 PendingErrorRequest(error_type="network_error")
+       ├─ 检测 status_code >= 400 → 构造 PendingErrorRequest(error_type="http_error"|"api_error")
+       └─ 调用 _wait_for_error_decision(pending, keepalive_task)
+            ├─ 将 PendingErrorRequest 存入 self.pending_errors[error_id]
+            ├─ 广播 WS 事件 "upstream_error" → UI 展示错误信息
+            ├─ 同时启动保活协程（stream 请求用 SSE ping，非 stream 用 chunked 空行）
+            └─ await pending.event.wait()  ← 挂起直到用户决策
+
+用户输入决策
+  └─ api_proxy.py: _handle_resolve_error()
+       └─ 发送 WS 命令 resolve_error {error_id, decision}
+            └─ api_server.py: _handle_ws_command() → resolve_error 分支
+                 ├─ pending.decision = user_action
+                 └─ pending.event.set()  ← 唤醒挂起的请求协程
+
+用户决策落地（唤醒后）
+  └─ api_server.py: _wait_for_error_decision() 返回 decision
+       └─ handle_anthropic_request() 根据 decision 执行对应逻辑
+            └─ "return_error" → 向客户端 StreamResponse 写入错误体后 write_eof()
+```
+
+#### 关键代码位置
+
+| 组件 | 文件 | 位置/方法 |
+|------|------|-----------|
+| 错误数据类 | `api_server.py` | `PendingErrorRequest` dataclass（文件顶部） |
+| 挂起等待逻辑 | `api_server.py` | `APIServer._wait_for_error_decision()` |
+| 保活：SSE ping | `api_server.py` | `APIServer._keepalive_sse()` |
+| 保活：chunked | `api_server.py` | `APIServer._keepalive_chunked()` |
+| 错误捕获入口 | `api_server.py` | `APIServer.handle_anthropic_request()` 中 `# 转发请求（捕获网络级错误...）` 注释段 |
+| WS 命令处理 | `api_server.py` | `_handle_ws_command()` → `elif action == "resolve_error":` 分支 |
+| UI 事件展示 | `api_proxy.py` | `_handle_server_event()` → `elif event_type == "upstream_error":` 分支 |
+| UI 决策命令 | `api_proxy.py` | `APIProxyApp._handle_resolve_error()` |
+
+#### 扩展新的决策选项
+
+要添加新的用户选项（如 "retry"、"fallback_to_other_provider" 等）：
+
+1. **UI 侧**（`api_proxy.py`）：
+   - 在 `upstream_error` 事件展示中添加新选项文字
+   - 在 `_handle_resolve_error()` 的 `action_map` 中添加新的编号/字符串映射
+   - 在 `action_desc` 中添加对应的中文描述
+
+2. **服务器侧**（`api_server.py`）：
+   - 在 `handle_anthropic_request()` 中 `# ── 处理决策 ──` 注释段下添加 `elif decision == "your_new_action":` 分支
+   - 实现对应的处理逻辑（重试、切换 provider 等）
+
+WS 协议（`resolve_error` 命令）：
+```json
+{"type": "command", "data": {"action": "resolve_error", "error_id": "<uuid>", "decision": "return_error"}}
+```
+
 ## Common Development Tasks
 
 When code is added, typical tasks might include:
@@ -207,9 +268,12 @@ Current implementation includes:
 3. Per-provider HTTP proxy support
 4. API proxy server with scheme-based routing and manual provider selection
 5. Statistics collection
+6. 上游错误暂停 + 用户决策机制（支持 "return_error" 选项）
+7. 客户端连接保活：SSE ping（流式请求）/ chunked 空行（非流式请求）
 
 ### Pending Integration
 1. Connect terminal UI with API server for real-time logging
 2. Display real-time statistics in terminal UI
 3. Persist conversation history and recovery state
 4. End-to-end testing of the proxy system
+5. 上游错误更多决策选项（retry / fallback provider）
