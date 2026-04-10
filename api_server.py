@@ -417,16 +417,91 @@ class APIServer:
                 if provider_type == "anthropic" else {"Authorization": "Bearer ***"}
             request_body = {}
 
+        trace_id = str(uuid.uuid4())
+
+        # ── traffic_chunk 阶段1：内部发起（类比 client_request）──────────
+        await self._broadcast_ws_message("traffic_chunk", {
+            "trace_id": trace_id,
+            "phase": "client_request",
+            "provider": provider_name,
+            "model": "list_models",
+            "method": "GET",
+            "incoming_url": f"[内部] update models {provider_name}",
+            "incoming_headers": {},
+            "request_body": request_body,
+            "timestamp": time.time(),
+        })
+
+        # ── traffic_chunk 阶段2：转发给 provider ─────────────────────────
+        await self._broadcast_ws_message("traffic_chunk", {
+            "trace_id": trace_id,
+            "phase": "forwarding",
+            "provider": provider_name,
+            "model": "list_models",
+            "method": "GET",
+            "url": request_url,
+            "timestamp": time.time(),
+        })
+
         try:
             models = await type_module.list_models(p)
             elapsed = time.time() - start_time
             status_code = 200
             error_msg = ""
+        except (TimeoutError, asyncio.TimeoutError) as e:
+            elapsed = time.time() - start_time
+            status_code = 0
+            error_msg = str(e) or f"请求超时（>{getattr(p, 'timeout', 60)}s）"
+            # ── traffic_chunk 阶段3：超时错误 ─────────────────────────────
+            await self._broadcast_ws_message("traffic_chunk", {
+                "trace_id": trace_id,
+                "phase": "provider_response",
+                "provider": provider_name,
+                "status_code": 0,
+                "response_time": elapsed,
+                "response_headers": {},
+                "response_body": {"error": f"网络超时: {error_msg}"},
+                "timestamp": time.time(),
+            })
+            log_data = {
+                "provider": provider_name,
+                "model": "list_models",
+                "method": "GET",
+                "incoming_url": f"[内部] update models {provider_name}",
+                "url": request_url,
+                "status_code": 0,
+                "success": False,
+                "response_time": elapsed,
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "total_tokens": 0,
+                "timestamp": time.time(),
+                "incoming_headers": {},
+                "request_body": request_body,
+                "forwarded_headers": request_headers,
+                "response_headers": {},
+                "response_body": {"error": f"网络超时: {error_msg}"},
+                "client_response_headers": {},
+                "client_response_body": {"error": f"网络超时: {error_msg}"},
+                "error_message": f"网络超时: {error_msg}",
+            }
+            asyncio.create_task(self._broadcast_request_log(log_data))
+            return {"success": False, "error": f"网络超时: {error_msg}"}
         except Exception as e:
             elapsed = time.time() - start_time
             status_code = 502
             error_msg = str(e)
-            # 广播失败的 traffic log
+            # ── traffic_chunk 阶段3：失败响应 ─────────────────────────────
+            await self._broadcast_ws_message("traffic_chunk", {
+                "trace_id": trace_id,
+                "phase": "provider_response",
+                "provider": provider_name,
+                "status_code": status_code,
+                "response_time": elapsed,
+                "response_headers": {},
+                "response_body": {"error": error_msg},
+                "timestamp": time.time(),
+            })
             log_data = {
                 "provider": provider_name,
                 "model": "list_models",
@@ -452,8 +527,20 @@ class APIServer:
             asyncio.create_task(self._broadcast_request_log(log_data))
             return {"success": False, "error": error_msg}
 
-        # 广播成功的 traffic log
+        # ── traffic_chunk 阶段3：成功响应 ─────────────────────────────────
         response_body_data: Any = {"models": models, "count": len(models)}
+        await self._broadcast_ws_message("traffic_chunk", {
+            "trace_id": trace_id,
+            "phase": "provider_response",
+            "provider": provider_name,
+            "status_code": 200,
+            "response_time": elapsed,
+            "response_headers": {"content-type": "application/json"},
+            "response_body": response_body_data,
+            "timestamp": time.time(),
+        })
+
+        # 广播成功的 request_log（操作 Tab 摘要）
         log_data = {
             "provider": provider_name,
             "model": "list_models",

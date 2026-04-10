@@ -83,6 +83,12 @@ class APIProxyApp(App):
         # key: error_id, value: dict with provider/model/status_code/error_message
         self.pending_error_ids: list = []  # 有序列表，方便用数字选择
 
+        # 请求/响应面板：追踪当前"活跃"的 trace_id，用于检测中途插入
+        # 当 forwarding/provider_response/client_response 到达时，
+        # 若 _traffic_current_trace 不等于本 trace_id，说明期间有其它请求插入，
+        # 需要新开一个"继续响应"记录头。
+        self._traffic_current_trace: Optional[str] = None
+
     async def _handle_server_event(self, event: Dict[str, Any]):
         """处理服务器事件"""
         event_type = event.get("type")
@@ -172,6 +178,7 @@ class APIProxyApp(App):
                 # 实时显示请求/响应各阶段数据
                 traffic_log = self.query_one("#traffic-log", RichLog)
                 phase = event_data.get("phase", "")
+                trace_id = event_data.get("trace_id", "")
                 provider = event_data.get("provider", "unknown")
                 model = event_data.get("model", "")
                 timestamp = datetime.fromtimestamp(event_data.get("timestamp", time.time())).strftime("%H:%M:%S")
@@ -179,6 +186,8 @@ class APIProxyApp(App):
                 if phase == "client_request":
                     method = event_data.get("method", "POST")
                     incoming_url = event_data.get("incoming_url", "")
+                    # 新请求到来时更新当前活跃 trace
+                    self._traffic_current_trace = trace_id
                     traffic_log.write(f"\n[bold yellow]{'─' * 60}[/bold yellow]")
                     traffic_log.write(f"[bold yellow]▶ [{timestamp}] 客户端请求 → 代理[/bold yellow]  [dim]model: {model}  provider: {provider}[/dim]")
                     traffic_log.write(f"  [dim]URL:[/dim]  {method} {incoming_url}")
@@ -191,7 +200,12 @@ class APIProxyApp(App):
                 elif phase == "forwarding":
                     method = event_data.get("method", "POST")
                     url = event_data.get("url", "")
-                    traffic_log.write(f"\n[bold cyan]▶ 转发请求 → {provider}[/bold cyan]")
+                    # 若当前活跃 trace 已被其它请求抢占，新开一条记录
+                    if trace_id and self._traffic_current_trace != trace_id:
+                        traffic_log.write(f"\n[bold yellow]{'─' * 60}[/bold yellow]")
+                        traffic_log.write(f"[bold yellow]↩ [{timestamp}] 继续响应[/bold yellow]  [dim]model: {model}  provider: {provider}[/dim]")
+                        self._traffic_current_trace = trace_id
+                    traffic_log.write(f"\n[bold cyan]▶ [{timestamp}] 转发请求 → {provider}[/bold cyan]")
                     traffic_log.write(f"  [dim]URL:[/dim]  {method} {url}")
                     traffic_log.write(f"  [dim cyan](等待响应...)[/dim cyan]")
                     traffic_log.scroll_end(animate=False)
@@ -201,12 +215,17 @@ class APIProxyApp(App):
                     response_time = event_data.get("response_time", 0)
                     color = "green" if status_code < 400 else "red"
                     status_str = f"HTTP {status_code}" if status_code else "网络错误"
+                    # 若当前活跃 trace 已被其它请求抢占，新开一条记录
+                    if trace_id and self._traffic_current_trace != trace_id:
+                        traffic_log.write(f"\n[bold yellow]{'─' * 60}[/bold yellow]")
+                        traffic_log.write(f"[bold yellow]↩ [{timestamp}] 继续响应[/bold yellow]  [dim]model: {model}  provider: {provider}[/dim]")
+                        self._traffic_current_trace = trace_id
                     # 补充显示转发请求的 headers（首次有数据时）
                     fwd_hdrs = event_data.get("forwarded_headers", {})
                     if fwd_hdrs:
                         traffic_log.write(f"  [dim]转发 Headers:[/dim]")
                         self._write_headers(traffic_log, fwd_hdrs)
-                    traffic_log.write(f"\n[bold {color}]◀ Provider 响应 ← {provider}[/bold {color}]  [{color}]{status_str}[/{color}]  [dim]{response_time:.2f}s[/dim]")
+                    traffic_log.write(f"\n[bold {color}]◀ [{timestamp}] Provider 响应 ← {provider}[/bold {color}]  [{color}]{status_str}[/{color}]  [dim]{response_time:.2f}s[/dim]")
                     traffic_log.write(f"  [dim]响应 Headers:[/dim]")
                     self._write_headers(traffic_log, event_data.get("response_headers", {}))
                     traffic_log.write(f"  [dim]Body:[/dim]")
@@ -217,19 +236,16 @@ class APIProxyApp(App):
                     status_code = event_data.get("status_code", 0)
                     response_time = event_data.get("response_time", 0)
                     color = "green" if status_code < 400 else "red"
-                    traffic_log.write(f"\n[bold magenta]◀ 发送给客户端[/bold magenta]  [{color}]HTTP {status_code}[/{color}]  [dim]{response_time:.2f}s[/dim]")
+                    # 若当前活跃 trace 已被其它请求抢占，新开一条记录
+                    if trace_id and self._traffic_current_trace != trace_id:
+                        traffic_log.write(f"\n[bold yellow]{'─' * 60}[/bold yellow]")
+                        traffic_log.write(f"[bold yellow]↩ [{timestamp}] 继续响应[/bold yellow]  [dim]model: {model}  provider: {provider}[/dim]")
+                        self._traffic_current_trace = trace_id
+                    traffic_log.write(f"\n[bold magenta]◀ [{timestamp}] 发送给客户端[/bold magenta]  [{color}]HTTP {status_code}[/{color}]  [dim]{response_time:.2f}s[/dim]")
                     traffic_log.write(f"  [dim]Headers:[/dim]")
                     self._write_headers(traffic_log, event_data.get("client_response_headers", {}))
                     traffic_log.write(f"  [dim]Body:[/dim]")
-                    client_body_str = event_data.get("client_response_body", "")
-                    # SSE 内容很长，只显示前500字符
-                    if isinstance(client_body_str, str) and len(client_body_str) > 500:
-                        traffic_log.write(f"    [dim](SSE流，共{len(client_body_str)}字节，显示前500字符)[/dim]")
-                        for ln in client_body_str[:500].splitlines():
-                            traffic_log.write(f"    {ln}")
-                        traffic_log.write(f"    [dim]...[/dim]")
-                    else:
-                        self._write_body(traffic_log, client_body_str)
+                    self._write_sse_body(traffic_log, event_data.get("client_response_body", ""))
                     traffic_log.scroll_end(animate=False)
 
             elif event_type == "providers_info":
@@ -508,6 +524,44 @@ class APIProxyApp(App):
             body_str = str(body)
         for line in body_str.splitlines():
             log.write(f"{indent}{line}")
+
+    def _write_sse_body(self, log: RichLog, body: Any, indent: str = "    ") -> None:
+        """辅助：写入 SSE body，连续 ping 事件折叠为 ping ×N 显示，其余完整输出"""
+        if body is None or body == "":
+            log.write(f"{indent}[dim](无)[/dim]")
+            return
+        if isinstance(body, (dict, list)):
+            # 非 SSE 格式，直接用 _write_body 处理
+            self._write_body(log, body, indent)
+            return
+
+        body_str = str(body)
+        # 将 SSE 文本按事件块（双换行）分割
+        import re as _re
+        # 每个 SSE 事件以 \n\n 结尾；分割后过滤空块
+        events = [e for e in _re.split(r'\n\n', body_str) if e.strip()]
+
+        PING_LINE = "event: ping"
+        pending_ping_count = 0
+
+        def flush_pings():
+            nonlocal pending_ping_count
+            if pending_ping_count > 0:
+                label = f"ping ×{pending_ping_count}" if pending_ping_count > 1 else "ping"
+                log.write(f"{indent}[dim]{label}[/dim]")
+                pending_ping_count = 0
+
+        for event in events:
+            lines = event.splitlines()
+            is_ping = any(ln.strip() == PING_LINE for ln in lines)
+            if is_ping:
+                pending_ping_count += 1
+            else:
+                flush_pings()
+                for ln in lines:
+                    log.write(f"{indent}{ln}")
+
+        flush_pings()
 
     def _write_traffic_log(self, log: RichLog, data: Dict[str, Any], timestamp: str, status_color: str, status_icon: str) -> None:
         """在请求/响应 Tab 写入详细流量信息"""

@@ -163,6 +163,40 @@ def _gemini_response_to_anthropic(response, model: str, msg_id: str) -> Dict:
 
 # ── Provider 接口实现 ──────────────────────────────────────────────────────────
 
+def _make_genai_client(provider: "ProviderConfig") -> genai.Client:
+    """
+    构造 genai.Client，将 provider 的代理和超时配置注入 HttpOptions。
+
+    - 代理：通过带 proxy 参数的 httpx.AsyncClient 注入 httpx_async_client
+    - 超时：HttpOptions.timeout 单位为毫秒，provider.timeout 单位为秒
+    """
+    timeout_ms = int((getattr(provider, "timeout", 60) or 60) * 1000)
+    proxy_url: Optional[str] = None
+    if getattr(provider, "proxy_enabled", False) and getattr(provider, "proxy_url", None):
+        raw = provider.proxy_url
+        auth = getattr(provider, "proxy_auth", None)
+        if auth:
+            from urllib.parse import urlparse, urlunparse
+            parsed = urlparse(raw)
+            netloc = f"{auth}@{parsed.hostname}"
+            if parsed.port:
+                netloc += f":{parsed.port}"
+            proxy_url = urlunparse(parsed._replace(netloc=netloc))
+        else:
+            proxy_url = raw
+
+    http_options_kwargs: dict = {"timeout": timeout_ms}
+    if proxy_url:
+        async_client = httpx.AsyncClient(proxy=proxy_url)
+        http_options_kwargs["httpx_async_client"] = async_client
+        logging.debug(f"Gemini client 使用代理: {proxy_url.split('@')[-1]}")
+
+    return genai.Client(
+        api_key=provider.api_key,
+        http_options=types.HttpOptions(**http_options_kwargs),
+    )
+
+
 def get_default_headers(provider: "ProviderConfig") -> Dict[str, str]:
     """Gemini 使用 SDK 调用，不需要自定义 HTTP 请求头"""
     return {
@@ -173,8 +207,11 @@ def get_default_headers(provider: "ProviderConfig") -> Dict[str, str]:
 
 async def list_models(provider: "ProviderConfig") -> List[str]:
     """查询 Gemini 可用模型列表"""
-    gemini_client = genai.Client(api_key=provider.api_key)
-    try:
+    import asyncio
+    gemini_client = _make_genai_client(provider)
+    timeout = getattr(provider, "timeout", 60) or 60
+
+    async def _do_list() -> List[str]:
         models = []
         async for m in await gemini_client.aio.models.list():
             name = getattr(m, "name", "") or ""
@@ -183,6 +220,13 @@ async def list_models(provider: "ProviderConfig") -> List[str]:
             if model_id:
                 models.append(model_id)
         return models
+
+    try:
+        return await asyncio.wait_for(_do_list(), timeout=timeout)
+    except asyncio.TimeoutError:
+        msg = f"请求超时（>{timeout}s）"
+        logging.error(f"Gemini 查询模型列表超时 (provider={provider.name}): {msg}")
+        raise TimeoutError(msg)
     except Exception as e:
         logging.error(f"Gemini 查询模型列表失败 (provider={provider.name}): {e}")
         raise
@@ -232,8 +276,8 @@ async def forward_request(
         config_kwargs["tools"] = tools
     gen_config = types.GenerateContentConfig(**config_kwargs) if config_kwargs else None
 
-    # 初始化 Gemini 客户端（每次使用 provider 的 api_key）
-    gemini_client = genai.Client(api_key=provider.api_key)
+    # 初始化 Gemini 客户端（含代理和超时配置）
+    gemini_client = _make_genai_client(provider)
 
     msg_id = f"msg_{uuid.uuid4().hex[:24]}"
 
