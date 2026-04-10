@@ -346,10 +346,17 @@ class Config:
         return None
 
     def get_provider_proxy_url(self, provider: ProviderConfig) -> Optional[str]:
-        """获取provider的代理URL"""
-        if provider.proxy_enabled and provider.proxy_url:
-            return provider.get_proxy_url_with_auth()
-        return None
+        """获取provider的代理URL（含认证信息）"""
+        if not provider.proxy_enabled or not provider.proxy_url:
+            return None
+        if provider.proxy_auth:
+            from urllib.parse import urlparse, urlunparse
+            parsed = urlparse(provider.proxy_url)
+            netloc = f"{provider.proxy_auth}@{parsed.hostname}"
+            if parsed.port:
+                netloc += f":{parsed.port}"
+            return urlunparse(parsed._replace(netloc=netloc))
+        return provider.proxy_url
 
     def update_provider_models(self, provider_name: str, models: List[str]) -> None:
         """

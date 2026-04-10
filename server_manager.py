@@ -61,26 +61,57 @@ class WebSocketClient:
         self.message_handlers: List[Callable] = []
         self._receive_task: Optional[asyncio.Task] = None
 
+    async def _cleanup_connection(self):
+        """清理旧连接资源"""
+        if self._receive_task and not self._receive_task.done():
+            self._receive_task.cancel()
+            try:
+                await self._receive_task
+            except asyncio.CancelledError:
+                pass
+            self._receive_task = None
+        if self.ws and not self.ws.closed:
+            try:
+                await self.ws.close()
+            except Exception:
+                pass
+        if self.session and not self.session.closed:
+            try:
+                await self.session.close()
+            except Exception:
+                pass
+        self.ws = None
+        self.session = None
+
     async def connect(self) -> bool:
-        """连接到WebSocket服务器"""
+        """连接到WebSocket服务器（含重连循环）"""
         if self.connected:
             return True
 
-        try:
-            self.session = aiohttp.ClientSession()
-            self.ws = await self.session.ws_connect(self.url)
-            self.connected = True
-            self.reconnect_attempts = 0
+        self.reconnect_attempts = 0
+        while self.reconnect_attempts <= self.max_reconnect_attempts:
+            await self._cleanup_connection()
+            try:
+                self.session = aiohttp.ClientSession()
+                self.ws = await self.session.ws_connect(self.url)
+                self.connected = True
+                self.reconnect_attempts = 0
 
-            # 启动接收任务
-            self._receive_task = asyncio.create_task(self._receive_messages())
-            logger.info(f"WebSocket连接到 {self.url} 成功")
-            return True
+                # 启动接收任务
+                self._receive_task = asyncio.create_task(self._receive_messages())
+                logger.info(f"WebSocket连接到 {self.url} 成功")
+                return True
 
-        except Exception as e:
-            logger.error(f"WebSocket连接失败 {self.url}: {e}")
-            await self._handle_connection_error(e)
-            return False
+            except Exception as e:
+                self.reconnect_attempts += 1
+                if self.reconnect_attempts <= self.max_reconnect_attempts:
+                    logger.warning(f"WebSocket连接失败 {self.url}: {e}，等待 {self.reconnect_delay}s 后重试 ({self.reconnect_attempts}/{self.max_reconnect_attempts})")
+                    await asyncio.sleep(self.reconnect_delay)
+                else:
+                    logger.error(f"WebSocket连接失败，已达最大重试次数 {self.max_reconnect_attempts}: {e}")
+                    return False
+
+        return False
 
     async def send_message(self, msg_type: str, data: Dict[str, Any]) -> Optional[str]:
         """发送消息到服务器"""
@@ -146,39 +177,35 @@ class WebSocketClient:
         self.message_handlers.append(handler)
         logger.debug(f"注册消息处理器，总数: {len(self.message_handlers)}")
 
-    async def _handle_connection_error(self, error: Exception):
-        """处理连接错误"""
-        self.reconnect_attempts += 1
-        if self.reconnect_attempts <= self.max_reconnect_attempts:
-            logger.info(f"等待 {self.reconnect_delay} 秒后重连 (尝试 {self.reconnect_attempts}/{self.max_reconnect_attempts})")
-            await asyncio.sleep(self.reconnect_delay)
-            await self.connect()
-        else:
-            logger.error(f"达到最大重连次数 {self.max_reconnect_attempts}，停止重连")
-
     async def _handle_disconnect(self):
-        """处理断开连接"""
+        """处理断开连接，在后台异步发起重连"""
         self.connected = False
-        if self._receive_task and not self._receive_task.done():
-            self._receive_task.cancel()
+        # 在新 task 中重连，避免在 _receive_messages task 内递归
+        asyncio.create_task(self._reconnect_loop())
 
-        # 尝试重连
-        await self._handle_connection_error(Exception("连接断开"))
+    async def _reconnect_loop(self):
+        """断线重连循环"""
+        for attempt in range(1, self.max_reconnect_attempts + 1):
+            logger.info(f"WebSocket断线重连: 等待 {self.reconnect_delay}s (尝试 {attempt}/{self.max_reconnect_attempts})")
+            await asyncio.sleep(self.reconnect_delay)
+            await self._cleanup_connection()
+            self.connected = False
+            try:
+                self.session = aiohttp.ClientSession()
+                self.ws = await self.session.ws_connect(self.url)
+                self.connected = True
+                self._receive_task = asyncio.create_task(self._receive_messages())
+                logger.info(f"WebSocket重连成功")
+                return
+            except Exception as e:
+                logger.warning(f"重连失败 ({attempt}/{self.max_reconnect_attempts}): {e}")
+        logger.error("WebSocket重连失败，已达最大重试次数")
 
     async def disconnect(self):
         """断开连接"""
         logger.info("断开WebSocket连接")
-        if self._receive_task and not self._receive_task.done():
-            self._receive_task.cancel()
-
-        if self.ws:
-            await self.ws.close()
-        if self.session:
-            await self.session.close()
-
         self.connected = False
-        self.ws = None
-        self.session = None
+        await self._cleanup_connection()
 
 
 class ServerManager:
@@ -205,6 +232,9 @@ class ServerManager:
         # 心跳监控
         self.heartbeat_timeout = 35.0  # 心跳超时时间(秒)
         self._heartbeat_check_task: Optional[asyncio.Task] = None
+
+        # 上次启动失败的 stderr，供 UI 读取
+        self.last_start_error: str = ""
 
         logger.info(f"ServerManager初始化完成，服务器地址: {host}:{port}")
 
@@ -248,9 +278,34 @@ class ServerManager:
 
             logger.info(f"服务器进程已启动，PID: {self.process.pid}")
 
-            # 等待服务器初始化
-            logger.info("等待服务器初始化...")
-            await asyncio.sleep(3)
+            # 轮询 /health 直到服务器就绪，最多等 15 秒
+            logger.info("等待服务器就绪...")
+            health_url = f"http://{self.host}:{self.port}/health"
+            ready = False
+            async with aiohttp.ClientSession() as probe:
+                for _ in range(30):
+                    await asyncio.sleep(0.5)
+                    # 检查进程是否已提前退出
+                    if self.process.poll() is not None:
+                        stderr_output = self.process.stderr.read() if self.process.stderr else ""
+                        stdout_output = self.process.stdout.read() if self.process.stdout else ""
+                        # 合并 stdout + stderr，配置错误等会出现在 stderr，logging 在 stdout
+                        combined = "\n".join(filter(None, [stderr_output, stdout_output])).strip()
+                        self.last_start_error = combined
+                        logger.error(f"服务器进程意外退出:\n{combined}")
+                        self.status.running = False
+                        await self._emit_event("server_start_error", {"stderr": combined})
+                        return False
+                    try:
+                        async with probe.get(health_url, timeout=aiohttp.ClientTimeout(total=1)) as resp:
+                            if resp.status == 200:
+                                ready = True
+                                break
+                    except Exception:
+                        pass
+
+            if not ready:
+                logger.warning("服务器在 15 秒内未就绪，仍尝试连接")
 
             # 连接WebSocket
             logger.info("连接WebSocket...")
@@ -350,9 +405,13 @@ class ServerManager:
 
         logger.debug(f"处理WebSocket消息: {msg_type}")
 
+        # 收到任何消息都表明 WS 连接正常
+        if not self.status.ws_connected:
+            self.status.ws_connected = True
+            await self._emit_event("server_status", self.status.to_dict())
+
         if msg_type == "server_status":
             # 心跳更新
-            self.status.ws_connected = True
             self.status.last_heartbeat = time.time()
 
             # 合并服务器状态数据

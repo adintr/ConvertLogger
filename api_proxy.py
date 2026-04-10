@@ -344,6 +344,20 @@ class APIProxyApp(App):
                 input_widget = self.query_one("#command-input", Input)
                 input_widget.placeholder = f"输入 'resolve error {idx} 1' 处理错误，或 'resolve error {idx} <选项号>'..."
 
+            elif event_type == "server_start_error":
+                # 服务器进程意外退出，显示错误输出
+                self.server_status["running"] = False
+                self.update_token_display()
+                self.update_title()
+                log = self.query_one("#api-log", RichLog)
+                output = event_data.get("stderr", "").strip()
+                log.write(f"[red]❌ 服务器进程崩溃，错误输出:[/red]")
+                if output:
+                    for line in output.splitlines()[-30:]:
+                        log.write(f"[red]  {line}[/red]")
+                else:
+                    log.write(f"[red]  （无错误输出，请检查 config.yaml）[/red]")
+
             elif event_type == "error":
                 # 显示错误信息
                 log = self.query_one("#api-log", RichLog)
@@ -354,6 +368,14 @@ class APIProxyApp(App):
             # 防止事件处理异常影响应用
             log = self.query_one("#api-log", RichLog)
             log.write(f"[yellow]⚠️  事件处理异常: {e}[/yellow]")
+
+    def _show_server_stderr(self, log):
+        """显示服务器进程的 stderr"""
+        stderr = self.server_manager.last_start_error.strip()
+        if stderr:
+            log.write(f"[red]── 服务器错误输出 ──[/red]")
+            for line in stderr.splitlines()[-30:]:
+                log.write(f"[red]  {line}[/red]")
 
     async def _auto_start_server(self):
         """自动启动API服务器"""
@@ -379,6 +401,7 @@ class APIProxyApp(App):
                 log.write(f"[dim]提示: 服务器已自动启动，您可以直接开始测试[/dim]")
             else:
                 log.write(f"[red]❌ API服务器启动失败[/red]")
+                self._show_server_stderr(log)
                 log.write(f"[dim]您仍可以手动输入 'start server' 尝试启动[/dim]")
         except Exception as e:
             log.write(f"[red]❌ 启动服务器时发生错误: {e}[/red]")
@@ -1003,6 +1026,7 @@ class APIProxyApp(App):
                 log.write(f"[dim]WebSocket连接中...[/dim]")
             else:
                 log.write(f"[red]❌ API服务器启动失败[/red]")
+                self._show_server_stderr(log)
         except Exception as e:
             log.write(f"[red]❌ 启动服务器时发生错误: {e}[/red]")
 

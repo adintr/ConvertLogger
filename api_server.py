@@ -7,6 +7,7 @@ Anthropic API代理服务器
 import asyncio
 import json
 import logging
+import sys
 import time
 import uuid
 from typing import Dict, List, Optional, Any, Tuple
@@ -148,7 +149,7 @@ class ProviderClient:
         }
 
         if proxy_url:
-            client_kwargs["proxies"] = proxy_url
+            client_kwargs["proxy"] = proxy_url
 
         self.client = httpx.AsyncClient(**client_kwargs)
         logging.info(f"已初始化 provider '{self.provider.name}' (type={self.provider.type})")
@@ -261,20 +262,20 @@ class APIServer:
 
     def setup_routes(self) -> None:
         """设置HTTP路由"""
-        # Anthropic API兼容端点
-        self.app.router.add_route("*", "/v1/messages", self.handle_anthropic_request)
-        self.app.router.add_route("*", "/v1/completions", self.handle_anthropic_request)
-
-        # 通用代理端点
-        self.app.router.add_route("*", "/{path:.*}", self.handle_proxy_request)
-
-        # 监控端点
+        # 监控端点（必须在通配路由之前注册）
         self.app.router.add_get("/health", self.handle_health)
         self.app.router.add_get("/stats", self.handle_stats)
         self.app.router.add_get("/config", self.handle_config)
 
-        # WebSocket端点
+        # WebSocket端点（必须在通配路由之前注册）
         self.app.router.add_get("/ws", self.handle_websocket)
+
+        # Anthropic API兼容端点
+        self.app.router.add_route("*", "/v1/messages", self.handle_anthropic_request)
+        self.app.router.add_route("*", "/v1/completions", self.handle_anthropic_request)
+
+        # 通用代理端点（通配路由放最后）
+        self.app.router.add_route("*", "/{path:.*}", self.handle_proxy_request)
 
     async def initialize(self) -> None:
         """初始化服务器"""
@@ -1910,10 +1911,10 @@ async def run_server(config_path: str = "config.yaml") -> None:
     # 验证配置
     errors = config.validate()
     if errors:
-        print("配置错误:")
+        print("配置错误:", file=sys.stderr)
         for error in errors:
-            print(f"  - {error}")
-        return
+            print(f"  - {error}", file=sys.stderr)
+        sys.exit(1)
 
     # 创建服务器
     server = APIServer(config)
