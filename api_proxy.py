@@ -4,7 +4,7 @@ Anthropic API代理终端
 将终端划分为三个区域显示不同内容
 """
 
-from textual import on
+from textual import events, on
 from textual.app import App, ComposeResult
 from textual.containers import Container, Horizontal, Vertical, ScrollableContainer
 import re as _re_markup
@@ -55,9 +55,10 @@ class TrafficBlock(Static):
         else:
             self.styles.height = "auto"
 
-    def on_click(self) -> None:
-        """点击时切换折叠状态"""
-        self.collapsed = not self.collapsed
+    def on_click(self, event: events.Click) -> None:
+        """仅点击三角符号（第一行）时切换折叠状态"""
+        if event.y == 0:
+            self.collapsed = not self.collapsed
 
     def add_line(self, line: str) -> None:
         """追加一行内容并刷新显示"""
