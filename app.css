@@ -73,7 +73,7 @@ Anthropic API代理终端样式
 }
 
 .traffic-client-ok {
-    color: $secondary;
+    color: $success;
 }
 
 .traffic-client-err {
