@@ -256,7 +256,30 @@ class APIProxyApp(App):
                     title = f"[{timestamp}] 转发请求 → {provider}{retry_label}"
                     block = TrafficBlock(title, classes="traffic-block traffic-forwarding")
                     block.add_line(f"  URL:  {method} {url}")
-                    block.add_line(f"  (等待响应...)")
+
+                    # 判断是否是 SDK 调用
+                    is_sdk_call = "[SDK]" in url or "[Gemini SDK]" in url
+
+                    forwarded_headers = event_data.get("forwarded_headers", {})
+                    forwarded_body = event_data.get("forwarded_body", {})
+
+                    if is_sdk_call:
+                        # SDK 调用：显示 SDK 参数
+                        block.add_line(f"  调用方式: SDK 调用")
+                        if isinstance(forwarded_body, dict):
+                            block.add_line(f"  SDK 参数:")
+                            self._block_write_body(block, forwarded_body)
+                        else:
+                            block.add_line(f"  SDK 参数: {forwarded_body}")
+                    else:
+                        # HTTP 调用：显示 headers 和 body
+                        if forwarded_headers:
+                            block.add_line(f"  转发 Headers:")
+                            self._block_write_headers(block, forwarded_headers)
+                        if forwarded_body:
+                            block.add_line(f"  Body:")
+                            self._block_write_body(block, forwarded_body)
+
                     self._traffic_current_block = block
                     await traffic_container.mount(block)
                     traffic_container.scroll_end(animate=False)

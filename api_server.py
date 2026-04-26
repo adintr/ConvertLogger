@@ -452,6 +452,8 @@ class APIServer:
             "model": "list_models",
             "method": "GET",
             "url": request_url,
+            "forwarded_headers": request_headers,
+            "forwarded_body": request_body,
             "timestamp": time.time(),
         })
 
@@ -911,6 +913,26 @@ class APIServer:
             })
 
             # ── 阶段2：向 Provider 转发请求 ────────────────────────────
+            # 先确保客户端已初始化，以获取默认 headers
+            if not provider_client.client:
+                await provider_client.initialize()
+            # 构建即将发送的 headers（客户端默认 headers + 请求传入的 headers）
+            default_headers = dict(provider_client.client.headers) if provider_client.client else {}
+            merged_forwarding_headers = {**default_headers, **headers}
+            # 脱敏敏感 headers
+            _sensitive = {"authorization", "x-api-key", "api-key"}
+            _masked_fwd_headers = {
+                k: ("***" if k.lower() in _sensitive else v)
+                for k, v in merged_forwarding_headers.items()
+            }
+            # 解析即将发送的 body
+            fwd_body_preview = {}
+            if modified_body:
+                try:
+                    fwd_body_preview = json.loads(modified_body)
+                except Exception:
+                    fwd_body_preview = modified_body.decode("utf-8", errors="replace")
+
             await self._broadcast_ws_message("traffic_chunk", {
                 "trace_id": trace_id,
                 "phase": "forwarding",
@@ -918,6 +940,8 @@ class APIServer:
                 "model": target_model,
                 "method": request.method,
                 "url": forwarded_url,
+                "forwarded_headers": _masked_fwd_headers,
+                "forwarded_body": fwd_body_preview,
                 "timestamp": time.time(),
             })
 
@@ -1077,6 +1101,24 @@ class APIServer:
                     upstream_error.provider_client = retry_client
                     retry_err: Optional[PendingErrorRequest] = None
                     retry_fwd_headers: Dict[str, str] = {}
+                    # 构建即将发送的 headers（客户端默认 headers + 重试 headers）
+                    if not retry_client.client:
+                        await retry_client.initialize()
+                    default_headers = dict(retry_client.client.headers) if retry_client.client else {}
+                    merged_fwd_headers = {**default_headers, **upstream_error.retry_headers}
+                    # 脱敏
+                    _sensitive = {"authorization", "x-api-key", "api-key"}
+                    _masked_fwd_headers = {
+                        k: ("***" if k.lower() in _sensitive else v)
+                        for k, v in merged_fwd_headers.items()
+                    }
+                    # 解析即将发送的 body
+                    retry_body_preview = {}
+                    if upstream_error.retry_body:
+                        try:
+                            retry_body_preview = json.loads(upstream_error.retry_body)
+                        except Exception:
+                            retry_body_preview = upstream_error.retry_body.decode("utf-8", errors="replace")
                     await self._broadcast_ws_message("traffic_chunk", {
                         "trace_id": trace_id,
                         "phase": "forwarding",
@@ -1084,6 +1126,8 @@ class APIServer:
                         "model": upstream_error.model,
                         "method": upstream_error.retry_method,
                         "url": f"{retry_client.provider.base_url.rstrip('/')}/{upstream_error.retry_path.lstrip('/')}",
+                        "forwarded_headers": _masked_fwd_headers,
+                        "forwarded_body": retry_body_preview,
                         "timestamp": time.time(),
                         "note": "retry",
                     })
@@ -1427,6 +1471,26 @@ class APIServer:
             })
 
             # ── 阶段2：向 Provider 转发请求 ────────────────────────────
+            # 先确保客户端已初始化，以获取默认 headers
+            if not provider_client.client:
+                await provider_client.initialize()
+            # 构建即将发送的 headers（客户端默认 headers + 请求传入的 headers）
+            default_headers = dict(provider_client.client.headers) if provider_client.client else {}
+            merged_forwarding_headers = {**default_headers, **headers}
+            # 脱敏敏感 headers
+            _sensitive = {"authorization", "x-api-key", "api-key"}
+            _masked_fwd_headers = {
+                k: ("***" if k.lower() in _sensitive else v)
+                for k, v in merged_forwarding_headers.items()
+            }
+            # 解析即将发送的 body
+            fwd_body_preview = {}
+            if modified_body:
+                try:
+                    fwd_body_preview = json.loads(modified_body)
+                except Exception:
+                    fwd_body_preview = modified_body.decode("utf-8", errors="replace")
+
             await self._broadcast_ws_message("traffic_chunk", {
                 "trace_id": trace_id,
                 "phase": "forwarding",
@@ -1434,6 +1498,8 @@ class APIServer:
                 "model": "unknown",
                 "method": request.method,
                 "url": forwarded_url,
+                "forwarded_headers": _masked_fwd_headers,
+                "forwarded_body": fwd_body_preview,
                 "timestamp": time.time(),
             })
 
@@ -1568,6 +1634,24 @@ class APIServer:
                     upstream_error.provider_client = retry_client2
                     retry_err2: Optional[PendingErrorRequest] = None
                     retry_fwd2: Dict[str, str] = {}
+                    # 构建即将发送的 headers（客户端默认 headers + 重试 headers）
+                    if not retry_client2.client:
+                        await retry_client2.initialize()
+                    default_headers = dict(retry_client2.client.headers) if retry_client2.client else {}
+                    merged_fwd_headers = {**default_headers, **upstream_error.retry_headers}
+                    # 脱敏
+                    _sensitive = {"authorization", "x-api-key", "api-key"}
+                    _masked_fwd_headers = {
+                        k: ("***" if k.lower() in _sensitive else v)
+                        for k, v in merged_fwd_headers.items()
+                    }
+                    # 解析即将发送的 body
+                    retry_body_preview = {}
+                    if upstream_error.retry_body:
+                        try:
+                            retry_body_preview = json.loads(upstream_error.retry_body)
+                        except Exception:
+                            retry_body_preview = upstream_error.retry_body.decode("utf-8", errors="replace")
                     await self._broadcast_ws_message("traffic_chunk", {
                         "trace_id": trace_id,
                         "phase": "forwarding",
@@ -1575,6 +1659,8 @@ class APIServer:
                         "model": "unknown",
                         "method": upstream_error.retry_method,
                         "url": f"{retry_client2.provider.base_url.rstrip('/')}/{upstream_error.retry_path.lstrip('/')}",
+                        "forwarded_headers": _masked_fwd_headers,
+                        "forwarded_body": retry_body_preview,
                         "timestamp": time.time(),
                         "note": "retry",
                     })
